@@ -44,6 +44,8 @@ const state = {
   saveTimer: null,
   follow: true,
   ab: { a: null, b: null },
+  // AB 循环自己把 currentTime 拨回去时置 true，seeked 处理器据此区分「我们干的」和「用户拖的」
+  abJump: false,
   replayUntil: null,
   // 刚点过的那一句：预卷的 150ms 里 tick 保持它，别让面板/highlight 抖回上一句
   seekLine: -1,
@@ -405,6 +407,8 @@ async function openVideo(pk, quiet = false) {
   clearWordHighlight();
   state.seekLine = -1;
   state.ab = { a: null, b: null };
+  state.abJump = false;
+  refreshABBadge();
   state.replayUntil = null;
   state.analysis = normalizeAnalysis(null);
   state.analysisDoneShown = -1;
@@ -693,9 +697,14 @@ function tick() {
   }
 
   // AB 循环
-  if (state.ab.a != null && state.ab.b != null && ms >= state.ab.b) {
-    state.seekLine = -1;
-    el.currentTime = state.ab.a / 1000;
+  if (state.ab.a != null && state.ab.b != null) {
+    if (state.ab.b <= state.ab.a) {
+      clearAB("AB 区间无效（终点不在起点之后），已退出循环");
+    } else if (ms >= state.ab.b || ms < state.ab.a - 500) {
+      state.seekLine = -1;
+      state.abJump = true;
+      el.currentTime = state.ab.a / 1000;
+    }
   }
 
   // 每 5 秒存一次进度
@@ -786,16 +795,65 @@ function refreshRateBadge() {
   badge.style.color = el.playbackRate === 1 ? "" : "var(--accent)";
 }
 
+/** 顶住「AB 循环中不知道怎么退出」：把状态显式画出来，Esc 随时能退 */
+function refreshABBadge() {
+  const badge = $("ab-badge");
+  if (!badge) return;
+  const { a, b } = state.ab;
+  if (a == null) {
+    badge.hidden = true;
+    badge.textContent = "";
+    return;
+  }
+  badge.hidden = false;
+  badge.textContent =
+    b == null
+      ? `AB 循环：起点 A ${fmtTime(a)}，再按 B 定终点（Esc 取消）`
+      : `AB 循环中：${fmtTime(a)} ↔ ${fmtTime(b)}（按 Esc 或拖到区间外退出）`;
+}
+
 function setAB(which) {
   const el = $("video");
   const ms = Math.round(el.currentTime * 1000);
+  if (which === "b") {
+    if (state.ab.a == null) {
+      toast("先按 A 定循环起点", "warn");
+      return;
+    }
+    // 终点在起点之前（或离得太近）会让循环变成原地抽搐
+    if (ms <= state.ab.a + 300) {
+      toast("B 点要在 A 点之后（至少 0.3 秒），已忽略", "warn");
+      return;
+    }
+  }
   state.ab[which] = ms;
-  toast(`${which.toUpperCase()} 点：${fmtTime(ms)}（${which === "a" ? "再按 B" : "开始循环"}）`, "ok");
+  refreshABBadge();
+  toast(
+    which === "a"
+      ? `A 点：${fmtTime(ms)}（再按 B 定终点，Esc 取消）`
+      : `B 点：${fmtTime(ms)}，开始循环（Esc 退出）`,
+    "ok",
+  );
 }
 
-function clearAB() {
+function clearAB(message) {
+  const had = state.ab.a != null || state.ab.b != null;
   state.ab = { a: null, b: null };
-  toast("已清除 AB 循环", "ok");
+  state.abJump = false;
+  refreshABBadge();
+  if (had || message) toast(message || "已退出 AB 循环", "ok");
+}
+
+/** 用户自己把进度拖/跳到 AB 区间外，就当他要正常看，顺手退出循环 */
+function onVideoSeeked() {
+  if (state.abJump) {
+    state.abJump = false;
+    return;
+  }
+  const { a, b } = state.ab;
+  if (a == null || b == null) return;
+  const ms = Math.round($("video").currentTime * 1000);
+  if (ms < a - 200 || ms > b + 200) clearAB("已退出 AB 循环（跳到区间外）");
 }
 
 /* ---------------------------------------------------------- 全局任务指示 */
@@ -1183,6 +1241,7 @@ function bindEvents() {
   });
 
   $("video").addEventListener("pause", () => savePlayback());
+  $("video").addEventListener("seeked", onVideoSeeked);
 
   window.addEventListener("beforeunload", () => {
     if (state.current) {
@@ -1243,6 +1302,14 @@ function bindEvents() {
         break;
       case "r": case "R":
         clearAB();
+        break;
+      case "Escape":
+        // ESC 任何时候都能把 AB 循环关掉，避免被关在循环里出不来
+        if (state.ab.a != null || state.ab.b != null || state.replayUntil != null) {
+          e.preventDefault();
+          state.replayUntil = null;
+          clearAB();
+        }
         break;
       case "s": case "S":
         toggleRate();
