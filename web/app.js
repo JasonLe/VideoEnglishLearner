@@ -38,6 +38,8 @@ const state = {
   nowSpans: [],
   activeIdx: -1,
   activeWord: -1,
+  wordEl: null,
+  nowWordEl: null,
   pollTimer: null,
   saveTimer: null,
   follow: true,
@@ -400,7 +402,7 @@ async function openVideo(pk, quiet = false) {
   state.current = video;
   state.segments = subs.segments || [];
   state.activeIdx = -1;
-  state.activeWord = -1;
+  clearWordHighlight();
   state.seekLine = -1;
   state.ab = { a: null, b: null };
   state.replayUntil = null;
@@ -589,7 +591,7 @@ function setActiveLine(idx) {
   if (prev) prev.el.classList.remove("on");
 
   state.activeIdx = idx;
-  state.activeWord = -1;
+  clearWordHighlight();
   const now = $("now-line");
   now.innerHTML = "";
   state.nowSpans = [];
@@ -613,20 +615,36 @@ function setActiveLine(idx) {
   renderAnalysisPanel(idx);
 }
 
+/** 清掉当前高亮的词（列表里的 + 顶部当前句里的） */
+function clearWordHighlight() {
+  if (state.wordEl) state.wordEl.classList.remove("on");
+  if (state.nowWordEl) state.nowWordEl.classList.remove("on");
+  state.wordEl = null;
+  state.nowWordEl = null;
+  state.activeWord = -1;
+}
+
+/**
+ * 高亮第 idx 行里的第 wordIdx 个词；wordIdx = -1 表示这一句此刻没有“正在念”的词
+ * （句首之前、句末之后都属于这种状态，播完就该灭）。
+ */
 function setActiveWord(idx, wordIdx) {
   const item = state.lineEls[idx];
   if (!item) return;
-  const prev = item.spans[state.activeWord];
-  if (prev) prev.classList.remove("on");
-  const cur = item.spans[wordIdx];
-  if (cur) cur.classList.add("on");
+  const target = wordIdx >= 0 ? item.spans[wordIdx] || null : null;
+  const nowTarget = wordIdx >= 0 ? state.nowSpans[wordIdx] || null : null;
+  if (target === state.wordEl && nowTarget === state.nowWordEl) return;
 
-  const nowPrev = state.nowSpans[state.activeWord];
-  if (nowPrev) nowPrev.classList.remove("on");
-  const nowCur = state.nowSpans[wordIdx];
-  if (nowCur) nowCur.classList.add("on");
-
-  state.activeWord = wordIdx;
+  clearWordHighlight();
+  if (target) {
+    target.classList.add("on");
+    state.wordEl = target;
+    state.activeWord = wordIdx;
+  }
+  if (nowTarget) {
+    nowTarget.classList.add("on");
+    state.nowWordEl = nowTarget;
+  }
 }
 
 let rafId = null;
@@ -659,7 +677,12 @@ function tick() {
   }
   if (idx !== state.activeIdx) setActiveLine(idx);
   if (idx >= 0) {
-    const wi = wordIdxForTime(state.segments[idx], ms);
+    const seg = state.segments[idx];
+    const words = wordListFor(seg);
+    let wi = wordIdxForTime(seg, ms);
+    const w = words[wi];
+    // 已经念过这个词（或还没念到）就不高亮：播放到句尾时最后一个词要跟着灭掉
+    if (!w || ms < w.start_ms || ms >= w.end_ms) wi = -1;
     if (wi !== state.activeWord) setActiveWord(idx, wi);
   }
 
