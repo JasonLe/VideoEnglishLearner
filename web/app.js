@@ -1329,14 +1329,36 @@ function bindEvents() {
       case "r": case "R":
         clearAB();
         break;
-      case "Escape":
-        // ESC 任何时候都能把 AB 循环关掉，避免被关在循环里出不来
-        if (state.ab.a != null || state.ab.b != null || state.replayUntil != null) {
+      case "Escape": {
+        // ESC 一次退掉所有「特殊播放状态」：AB 循环、单句复读、0.75 倍速。
+        // 否则调慢速之后想回到正常速度，只能再摸一次 S 键，容易以为「被卡住了」。
+        const vEl = $("video");
+        const slow = Math.abs(vEl.playbackRate - 1) > 1e-6;
+        const hasAB = state.ab.a != null || state.ab.b != null;
+        const replaying = state.replayUntil != null;
+        if (slow || hasAB || replaying) {
           e.preventDefault();
+          const parts = [];
+          if (replaying) parts.push("单句复读");
+          if (hasAB) parts.push("AB 循环");
+          if (slow) parts.push("0.75 倍速");
+
           state.replayUntil = null;
-          clearAB();
+          state.ab = { a: null, b: null };
+          state.abJump = false;
+          refreshABBadge();
+          if (slow) {
+            vEl.playbackRate = 1;
+            refreshRateBadge();
+            savePlayback();
+          }
+          toast(
+            `已退出：${parts.join(" / ")}${slow ? "，已回到 1.0 倍速" : ""}`,
+            "ok",
+          );
         }
         break;
+      }
       case "s": case "S":
         toggleRate();
         break;
