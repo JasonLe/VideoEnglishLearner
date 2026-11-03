@@ -1,0 +1,14 @@
+# 让 faster-whisper 跑在 NVIDIA 显卡上的运行库（可选，约 2GB）
+#
+# ctranslate2 4.8 需要 CUDA 12 + cuDNN 9 的 DLL。装了这几个 wheel 就不用另装
+# CUDA Toolkit / cuDNN 安装包了 —— app/transcribe.py 会自动把 nvidia/*/bin
+# 挂进 DLL 搜索路径（os.add_dll_directory + PATH），加载不到就静默退 CPU。
+#
+#   pip install -r requirements-asr-gpu.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 显存参考（RTX 3060 6GB）：large-v3 + int8_float16 约 3GB，能跑。
+# 实测 9 分钟音频：GPU 约 3 分钟（含首次下模型），CPU int8 会慢好几倍。
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cuda-nvrtc-cu12

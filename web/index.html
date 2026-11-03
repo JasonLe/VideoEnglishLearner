@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>vel · VideoEnglishLearner</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand" title="VideoEnglishLearner"><span>v</span>el</div>
+    <form id="add-form" class="add-form" autocomplete="off">
+      <input id="url-input" type="text" placeholder="粘贴 YouTube 链接，回车添加…" />
+      <select id="add-mode" title="添加模式：只取字幕最快，只取视频不下载字幕">
+        <option value="video+subs">视频 + 字幕</option>
+        <option value="subs-only">只取字幕</option>
+        <option value="video-only">只取视频</option>
+      </select>
+      <button type="submit">添加</button>
+    </form>
+    <div id="health" class="health"></div>
+    <div id="task-bar" class="task-bar hidden"></div>
+    <button id="settings-btn" class="ghost topbar-btn" type="button">设置</button>
+  </header>
+
+  <main>
+    <div id="env-warn" class="env-warn" hidden></div>
+
+    <!-- 库 -->
+    <section id="library-view" class="view">
+      <div id="empty-hint" class="empty-hint">
+        <h2>还没有视频</h2>
+        <p>把 YouTube 链接粘到上面的输入框。下载 + 字幕解析 + 切分一条龙，完成后点进去就能精听。</p>
+        <p class="dim">第一次用请先在 config.toml 里配好 <code>[network] proxy</code>（国内访问 YouTube 必须走代理）。</p>
+      </div>
+      <div id="video-list" class="video-list"></div>
+    </section>
+
+    <!-- 播放器 -->
+    <section id="player-view" class="view hidden">
+      <div class="player-head">
+        <button id="back-btn" class="ghost" type="button">← 返回</button>
+        <div class="player-meta">
+          <h1 id="video-title"></h1>
+          <div id="video-sub" class="dim"></div>
+          <div id="player-actions" class="player-actions" hidden>
+            <a id="dl-video" class="icon-btn" href="#" download>下载视频</a>
+            <a id="dl-subs" class="icon-btn" href="#" download>下载字幕</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="player-grid">
+        <div class="stage">
+          <div class="video-wrap">
+            <video id="video" controls playsinline preload="metadata"></video>
+          </div>
+          <div id="now-line" class="now-line"></div>
+          <div id="analysis-panel" class="analysis-panel"></div>
+          <div class="hint-row">
+            <span><kbd>空格</kbd> 播放</span>
+            <span><kbd>←</kbd><kbd>→</kbd> ±3s</span>
+            <span><kbd>↑</kbd><kbd>↓</kbd> 上/下一句</span>
+            <span><kbd>Enter</kbd> 复读</span>
+            <span><kbd>A</kbd>/<kbd>B</kbd> AB 循环</span>
+            <span><kbd>S</kbd> 0.75×</span>
+            <span><kbd>N</kbd> 精听模式</span>
+          </div>
+        </div>
+
+        <aside class="subs-panel">
+          <div class="panel-head">
+            <span id="subs-count" class="dim">字幕</span>
+            <label class="toggle"><input type="checkbox" id="auto-scroll" checked /> 跟随</label>
+            <button id="analyze-btn" class="ghost small" type="button">解析</button>
+          </div>
+          <div class="panel-tools">
+            <label class="dim small" for="subs-mode">精听</label>
+            <select id="subs-mode">
+              <option value="bilingual">双语</option>
+              <option value="en-only">只听英文（遮住中文）</option>
+              <option value="write">遮住英文（听写）</option>
+            </select>
+          </div>
+          <div id="subtitle-list" class="subtitle-list"></div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section id="settings-view" class="view hidden">
+      <div class="settings-head">
+        <button id="settings-back" class="ghost" type="button">← 返回</button>
+        <h2>设置</h2>
+        <span id="settings-file" class="dim small mono"></span>
+      </div>
+
+      <div id="ffmpeg-status" class="ffmpeg-status"></div>
+
+      <div id="settings-body" class="settings-body"></div>
+
+      <div class="settings-actions">
+        <button id="settings-save" type="button">保存并生效</button>
+        <button id="settings-reset" class="ghost" type="button">恢复默认值</button>
+        <span class="dim small">监听地址 / 端口改了要重启服务；其它项保存后对下一个任务生效</span>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

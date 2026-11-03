@@ -1,0 +1,65 @@
+# vel（VideoEnglishLearner）配置。可以直接改这个文件，也可以在网页右上角「设置」里改（保存时会写回这里）。
+# 改完重启服务生效；设置页里改的 proxy / ffmpeg 路径等是对后续任务立即生效的。
+
+[server]
+# 只监听本机；想让局域网其它设备访问改成 0.0.0.0（自己清楚风险就行）
+host = "127.0.0.1"
+# 改了端口要重启服务
+port = 8787
+
+[network]
+# 国内访问 YouTube 必须走代理，例 "http://127.0.0.1:7890"；能直连就留空
+proxy = "http://127.0.0.1:7890"
+# 遇到「人机校验」时填：浏览器插件导出的 cookies（Netscape 格式）文件路径
+cookies_file = ""
+
+[download]
+# ffmpeg.exe 的完整路径，或它所在的目录；留空 = 用 PATH 里的 ffmpeg
+# YouTube 只提供分离的音视频流，没有 ffmpeg 合并不出能播的视频
+ffmpeg_location = ""
+# 最高分辨率，0 = 不限；学习场景 720p 足够，再高只是白等
+max_height = 720
+# video+subs = 下载视频 + 字幕（播放器必需）
+# subs-only  = 只取字幕（省带宽；没装 ffmpeg 时也能先把链路跑通）
+mode = "video+subs"
+
+[asr]
+# auto    = 先找 YouTube 官方/自动字幕；视频确实没有字幕时才本地转写
+# youtube = 只用 YouTube 字幕，拿不到就报错
+# whisper = 强制本地转写
+# （被 429 限流不算「没有字幕」：auto 只让你稍后补字幕，不白跑转写）
+backend = "auto"
+# 显存吃紧可换 "medium" 或 "distil-large-v3"
+whisper_model = "large-v3"
+# 没独显就填 "cpu"
+device = "cuda"
+# 6GB 显存用 "int8_float16" 最稳；CPU 用 "int8"
+compute_type = "int8_float16"
+# 转写语言；英文视频填 en，留空让模型自己判断
+language = "en"
+# 用 VAD 跳过静音段，能显著减少 Whisper 的幻听
+vad_filter = true
+# 解码束宽，越大越准也越慢
+beam_size = 5
+
+[llm]
+# 任何 OpenAI 兼容接口都行：DeepSeek 填 https://api.deepseek.com/v1；本地 Ollama 填 http://localhost:11434/v1，模型名填你 pull 下来的本地模型
+base_url = "https://api.deepseek.com/v1"
+# DeepSeek 的 key 形如 sk-…；本地 Ollama 随便填一个非空串即可。只存在这台机器上
+api_key = ""
+# DeepSeek 用 "deepseek-chat"；本地 Ollama 填你 pull 下来的模型名
+model = "deepseek-chat"
+# 每次请求喂几行字幕。太大容易超时/漏项，太小请求次数多；10 行是稳的
+batch_size = 10
+# 单次请求超时（毫秒）。本地小模型出字慢，可以调到 180000
+timeout_ms = 90000
+
+[segment]
+# 一行字幕的视觉长度上限（英文≈字符数）
+max_chars = 42
+# 切分的理想行长，比上限小一点看起来更稳
+target_chars = 32
+# 一行最长显示时间，超了强制再切
+max_ms = 7000
+# 太短的行会闪，切分时尽量避免
+min_ms = 900

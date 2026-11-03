@@ -1,0 +1,9 @@
+# 本地转写依赖（可选，约 150MB）
+# 只有在「视频确实没有英文字幕」时才用得上：字幕接口被 429 限流不算没有字幕。
+# 国内装得慢就加镜像：
+#   pip install -r requirements-asr.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+faster-whisper>=1.0.3
+
+# PyAV 19 去掉了 faster-whisper 1.2.x 仍在用的 metadata_errors 参数，
+# 装上 av 19 会在转写时炸在 av.open(...)。这里锁在上一个大版本。
+av<19

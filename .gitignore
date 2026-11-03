@@ -1,0 +1,9 @@
+data/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.srt
+.DS_Store
+.tmp/
+config.toml
