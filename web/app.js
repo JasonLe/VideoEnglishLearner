@@ -436,6 +436,15 @@ async function openVideo(pk, quiet = false) {
   renderAnalysisPanel(-1);
   showView("player");
 
+  // 焦点可能还停在添加框、卡片按钮或设置控件上：不清掉的话空格会先被它们吃掉
+  if (
+    document.activeElement &&
+    document.activeElement !== document.body &&
+    typeof document.activeElement.blur === "function"
+  ) {
+    document.activeElement.blur();
+  }
+
   // 解析可能早就在后台跑了：打开视频就直接接上轮询，不用再点一次
   if (ANALYSIS_ACTIVE.includes((state.analysis && state.analysis.status) || "none")) {
     startAnalysisPoll(pk);
@@ -1261,17 +1270,34 @@ function bindEvents() {
 
   document.addEventListener("keydown", (e) => {
     const tag = (e.target.tagName || "").toLowerCase();
-    // select 也要放过：否则焦点在「精听」下拉里时 ↑↓ 会同时跳字幕行
-    if (tag === "input" || tag === "textarea" || tag === "select") return;
     if ($("player-view").classList.contains("hidden")) return;
     if (!state.current) return;
     const el = $("video");
+    const isSpace = e.key === " " || e.code === "Space";
+
+    // 空格在播放页里永远等于播放/暂停。
+    // 焦点若停在输入框 / 下拉 / 复选框上，浏览器会先把空格交给控件（打字、拉开下拉、勾选），
+    // 快捷键就「不好使」了——所以这里先 preventDefault，再把焦点收回来自己处理。
+    if (isSpace) {
+      if (e.isComposing || e.repeat) return;
+      e.preventDefault();
+      const active = document.activeElement;
+      if (
+        active &&
+        active !== document.body &&
+        typeof active.blur === "function"
+      ) {
+        active.blur();
+      }
+      if (el.paused) el.play().catch(() => {});
+      else el.pause();
+      return;
+    }
+
+    // select 也要放过：否则焦点在「精听」下拉里时 ↑↓ 会同时跳字幕行
+    if (tag === "input" || tag === "textarea" || tag === "select") return;
 
     switch (e.key) {
-      case " ":
-        e.preventDefault();
-        if (el.paused) el.play(); else el.pause();
-        break;
       case "ArrowRight":
         e.preventDefault();
         state.seekLine = -1;
