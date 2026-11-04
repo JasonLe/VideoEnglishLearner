@@ -88,12 +88,14 @@ def _endpoint(url: str) -> str:
 
 
 def _opener() -> urllib.request.OpenerDirector:
-    """走配置里的代理（国内访问 OpenAI 之类才需要；DeepSeek 和本地模型不需要）。"""
-    proxy = cfg.proxy
-    if proxy:
-        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-        return urllib.request.build_opener(handler)
-    return urllib.request.build_opener()
+    """走配置里的代理（国内访问 OpenAI 之类才需要；DeepSeek 和本地模型不需要）。
+
+    证书上下文也统一走 app/net.py：python.org 的 macOS Python 没带 CA，直连 https
+    会 CERTIFICATE_VERIFY_FAILED，那里会自动回退到系统证书文件。
+    """
+    from . import net
+
+    return net.opener(str(cfg.proxy or ""))
 
 
 def _decode(raw: bytes) -> str:

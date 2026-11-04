@@ -17,3 +17,13 @@ def ensure_utf8_stdio() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
+
+
+# python.org 的 macOS Python 没带 CA 证书；在导入 yt-dlp 之前修好环境变量，
+# 否则「下载视频」会报 CERTIFICATE_VERIFY_FAILED（_ssl.c:1077）。
+try:
+    from .net import ensure_ca_env as _ensure_ca_env
+
+    _ensure_ca_env()
+except Exception:  # noqa: BLE001 - 证书环境修不好也不能影响启动
+    pass

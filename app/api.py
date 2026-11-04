@@ -109,13 +109,16 @@ def _require(pk: int) -> dict[str, Any]:
 
 @router.get("/health")
 def health() -> dict[str, Any]:
+    from . import dict as dictionary
     from . import llm
     from .download import ffmpeg_status
 
     ff = ffmpeg_status()
+    dict_state = dictionary.status()
     return {
         "ok": True,
         "jobs": _jobs_payload(),
+        "dict": {"installed": dict_state["installed"], "entries": dict_state["entries"]},
         "ffmpeg": bool(ff.get("ok")),
         "ffmpeg_exe": ff.get("exe", ""),
         "ffmpeg_version": ff.get("version", ""),
@@ -154,6 +157,270 @@ def llm_check(body: LlmCheckBody) -> dict[str, Any]:
     from . import llm
 
     return llm.probe(body.base_url, body.api_key, body.model)
+
+
+# ---------------------------------------------------------------- 词典 / 生词本
+
+
+class DictInstallBody(BaseModel):
+    force: bool = False
+
+
+class ExplainBody(BaseModel):
+    word: str = ""
+    lemma: str = ""
+    sentence: str = ""
+    pk: int | None = None
+    seq: int | None = None
+
+
+class VocabBody(BaseModel):
+    word: str
+    lemma: str = ""
+    phonetic: str = ""
+    pos: str = ""
+    tags: list[dict[str, str]] = []
+    translation: str = ""
+    definition: str = ""
+    status: str = "learning"
+    note: str = ""
+    source: dict[str, Any] = {}
+
+
+class VocabPatchBody(BaseModel):
+    status: str | None = None
+    note: str | None = None
+
+
+class ReviewBody(BaseModel):
+    grade: int = 3
+
+
+@router.get("/dict/status")
+def dict_status() -> dict[str, Any]:
+    from . import dict as dictionary
+
+    return dictionary.status()
+
+
+@router.post("/dict/install")
+def dict_install(body: DictInstallBody | None = None) -> dict[str, Any]:
+    from . import dict as dictionary
+
+    force = bool(body and body.force)
+    if dictionary.status()["downloading"]:
+        raise HTTPException(status_code=409, detail="正在下载/构建中，稍等一下")
+    return dictionary.install(force=force)
+
+
+@router.delete("/dict")
+def dict_delete() -> dict[str, Any]:
+    from . import dict as dictionary
+
+    try:
+        return dictionary.delete()
+    except dictionary.DictError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@router.get("/dict/lookup")
+def dict_lookup(q: str = "", pk: int | None = None, seq: int | None = None) -> dict[str, Any]:
+    from . import dict as dictionary
+
+    return dictionary.lookup(q, pk=pk, seq=seq)
+
+
+@router.post("/dict/explain")
+def dict_explain(body: ExplainBody) -> dict[str, Any]:
+    from . import dict as dictionary
+
+    try:
+        return dictionary.explain(body.word, body.sentence, lemma=body.lemma)
+    except dictionary.DictError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@router.get("/vocab")
+def list_vocab(
+    status: str = "all",
+    q: str = "",
+    tag: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    sort: str = "recent",
+) -> dict[str, Any]:
+    try:
+        items, total = db.vocab_list(
+            status=status, q=q, tag=tag, limit=limit, offset=offset, sort=sort
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"items": items, "total": total, "stats": db.vocab_stats()}
+
+
+@router.get("/vocab/known")
+def vocab_known() -> dict[str, object]:
+    """生词本里各状态的词 + 学习中的词的变形（前端字幕打点用）。"""
+    from . import dict as dictionary
+
+    data: dict[str, object] = db.vocab_known()
+    learning = list(data.get("learning") or [])
+    if learning and dictionary.is_installed():
+        try:
+            data["forms"] = dictionary.forms_for(learning)
+        except Exception:  # 词典坏了也不能影响字幕
+            data["forms"] = []
+    else:
+        data["forms"] = []
+    return data
+
+
+@router.get("/vocab/export")
+def vocab_export(format: str = "tsv"):
+    """导出给 Anki / Excel：TSV 带 Anki 头，CSV/JSON 备查。"""
+    import csv
+    import io
+    import json
+
+    from fastapi.responses import Response
+
+    items, _total = db.vocab_list(status="all", limit=500, offset=0)
+    # 生词本可能超过 500，循环取全
+    if _total > 500:
+        items = []
+        offset = 0
+        while offset < _total:
+            chunk, _ = db.vocab_list(status="all", limit=500, offset=offset)
+            items.extend(chunk)
+            offset += 500
+
+    def clean(value: Any) -> str:
+        text = str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " / ")
+        return text.strip()
+
+    headers = ["word", "lemma", "phonetic", "tags", "translation", "status", "note",
+               "due_at", "reps", "lapses", "created_at"]
+    rows = []
+    for item in items:
+        tag_text = " ".join(t.get("code", "") for t in item.get("tags") or [])
+        rows.append([
+            item.get("word", ""), item.get("lemma", ""), item.get("phonetic", ""), tag_text,
+            item.get("translation", ""), item.get("status", ""), item.get("note", ""),
+            item.get("due_at", 0), item.get("reps", 0), item.get("lapses", 0),
+            item.get("created_at", ""),
+        ])
+
+    fmt = (format or "tsv").strip().lower()
+    if fmt == "json":
+        body = json.dumps(
+            [dict(zip(headers, [clean(c) for c in row])) for row in rows],
+            ensure_ascii=False, indent=2,
+        )
+        filename, media = "vel-vocab.json", "application/json; charset=utf-8"
+    elif fmt == "csv":
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(headers)
+        writer.writerows([[clean(c) for c in row] for row in rows])
+        body, filename, media = buffer.getvalue(), "vel-vocab.csv", "text/csv; charset=utf-8"
+    else:
+        lines = ["#separator:tab", "#html:false", "\t".join(headers)]
+        lines.extend("\t".join(clean(c) for c in row) for row in rows)
+        body, filename, media = "\n".join(lines) + "\n", "vel-vocab.tsv", "text/tab-separated-values; charset=utf-8"
+
+    return Response(
+        content=("\ufeff" + body) if fmt == "csv" else body,
+        media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/vocab")
+def create_vocab(body: VocabBody) -> dict[str, Any]:
+    try:
+        item, created = db.vocab_upsert(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "created": created, "item": item}
+
+
+@router.patch("/vocab/{vocab_id}")
+def patch_vocab(vocab_id: int, body: VocabPatchBody) -> dict[str, Any]:
+    try:
+        item = db.vocab_update(vocab_id, status=body.status, note=body.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="生词不存在")
+    return {"ok": True, "item": item}
+
+
+@router.delete("/vocab/{vocab_id}")
+def delete_vocab(vocab_id: int) -> dict[str, Any]:
+    if not db.vocab_delete(vocab_id):
+        raise HTTPException(status_code=404, detail="生词不存在")
+    return {"ok": True}
+
+
+@router.get("/vocab/{vocab_id}/occurrences")
+def vocab_occurrences(vocab_id: int) -> dict[str, Any]:
+    item = db.vocab_get(vocab_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="生词不存在")
+    rows = db.vocab_occurrences(item["word"], item.get("lemma") or "")
+    return {"items": rows[:30], "truncated": len(rows) >= 30}
+
+
+@router.post("/vocab/{vocab_id}/review")
+def review_vocab(vocab_id: int, body: ReviewBody) -> dict[str, Any]:
+    from . import srs
+
+    item = db.vocab_get(vocab_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="生词不存在")
+    if body.grade not in (1, 2, 3, 4):
+        raise HTTPException(status_code=400, detail="grade 只能是 1/2/3/4")
+
+    state = srs.schedule(
+        {
+            "stability": item.get("stability") or 0,
+            "difficulty": item.get("difficulty") or 0,
+            "reps": item.get("reps") or 0,
+            "lapses": item.get("lapses") or 0,
+            "last_review": item.get("last_review") or 0,
+        },
+        body.grade,
+        db.now_ms(),
+    )
+    saved = db.save_review_state(vocab_id, state)
+    db.add_review(
+        vocab_id,
+        grade=body.grade,
+        reviewed_at=state["last_review"],
+        elapsed_days=state["elapsed_days"],
+        scheduled_days=state["interval_days"],
+        stability=state["stability"],
+        difficulty=state["difficulty"],
+    )
+    return {
+        "ok": True,
+        "item": saved,
+        "scheduled_days": state["interval_days"],
+        "interval_days": state["interval_days"],
+        "due_at": state["due_at"],
+        "stability": state["stability"],
+        "difficulty": state["difficulty"],
+        "reps": state["reps"],
+    }
+
+
+@router.get("/videos/{pk}/coverage")
+def video_coverage(pk: int) -> dict[str, Any]:
+    from . import coverage
+
+    _require(pk)
+    return coverage.coverage(pk)
+
 
 
 @router.post("/videos")

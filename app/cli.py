@@ -563,6 +563,141 @@ def _selftest() -> int:
     finally:
         db.DB_FILE = saved_db
 
+    print("[12] srs（FSRS 排程）")
+    from . import srs
+
+    now = 1_760_000_000_000
+    first = srs.schedule(None, 3, now)
+    check("首次复习 stability", abs(first["stability"] - 3.7145) < 1e-3, str(first["stability"]))
+    check("首次间隔约 3.7 天", 3.5 <= first["interval_days"] <= 3.9, str(first["interval_days"]))
+    check("due 在未来", first["due_at"] > now)
+    again = srs.schedule(None, 1, now)
+    check("grade 1 十分钟后重看", 0 < again["due_at"] - now <= 11 * 60 * 1000)
+    easy = srs.schedule(first, 4, now + 4 * 86_400_000)
+    hard = srs.schedule(first, 2, now + 4 * 86_400_000)
+    check("grade 4 间隔大于 grade 2", easy["interval_days"] > hard["interval_days"])
+    check("复习次数递增", easy["reps"] == first["reps"] + 1 and hard["reps"] == first["reps"] + 1)
+    check("难度有界", 1.0 <= easy["difficulty"] <= 10.0, str(easy["difficulty"]))
+
+    print("[13] 生词本 db（收藏 / 复习 / 统计 / 出现位置）")
+    saved_db = db.DB_FILE
+    try:
+        with _scratch_dir() as tmp:
+            db.DB_FILE = Path(tmp) / "vocab.db"
+            db.init_db()
+            pk = db.create_video("https://youtu.be/aaaaaaaaaaa", "aaaaaaaaaaa", "t", "c", 6000, "")
+            db.replace_segments(
+                pk,
+                [
+                    Segment(seq=0, start_ms=0, end_ms=2000, text="I walked into the room."),
+                    Segment(seq=1, start_ms=2000, end_ms=4000, text="She walked away quickly."),
+                ],
+            )
+            db.set_status(pk, "ready")  # 出现位置只统计 ready 视频
+            item, created = db.vocab_upsert({
+                "word": "walked", "lemma": "walk", "phonetic": "wɔːk",
+                "tags": [{"code": "cet4", "label": "四级"}], "translation": "走",
+                "source": {"pk": pk, "seq": 0, "sentence": "I walked into the room.", "start_ms": 0},
+            })
+            check("收藏新词", created and item["word"] == "walked", str(item.get("word")))
+            check("来源视频回填", item["source_pk"] == pk and item["source_title"] == "t")
+            again, created2 = db.vocab_upsert({"word": "walked", "status": "learning"})
+            check("同词去重", not created2 and again["id"] == item["id"])
+            check("due_in_days 有值", (again.get("due_in_days") or 0) <= 10, str(again.get("due_in_days")))
+            listing, total = db.vocab_list(status="due", limit=10)
+            check("到期列表含新词", total == 1 and listing[0]["word"] == "walked", f"{total}")
+            stats = db.vocab_stats()
+            check("统计 learning=1", stats["learning"] == 1 and stats["due_now"] == 1, str(stats))
+            state = srs.schedule(None, 3, db.now_ms())
+            db.save_review_state(item["id"], state)
+            db.add_review(
+                item["id"],
+                grade=3,
+                reviewed_at=state["last_review"],
+                elapsed_days=state["elapsed_days"],
+                scheduled_days=state["interval_days"],
+                stability=state["stability"],
+                difficulty=state["difficulty"],
+            )
+            stats = db.vocab_stats()
+            check("今日复习计数", stats["reviews_today"] == 1 and stats["streak_days"] == 1, str(stats))
+            db.vocab_update(item["id"], status="known")
+            known = db.vocab_known()
+            check("known 映射含原词与原形", "walked" in known["known"] and "walk" in known["known"])
+            occ = db.vocab_occurrences("walked", "walk", limit=10)
+            check("出现位置跨行", len(occ) == 2, str(len(occ)))
+            check("出现位置带视频标题", occ[0].get("title") == "t")
+            db.vocab_delete(item["id"])
+            check("删除后归零", db.vocab_stats()["all"] == 0)
+    finally:
+        db.DB_FILE = saved_db
+
+    print("[14] 词典构建 + 查词 + 词形还原 + 覆盖率")
+    from . import dict as dictionary
+    from . import dictbuild
+
+    saved_path = dictionary.db_path
+    try:
+        with _scratch_dir() as tmp:
+            base = Path(tmp)
+            mini_csv = base / "mini.csv"
+            mini_csv.write_text(
+                "word,phonetic,definition,translation,pos,collins,oxford,tag,bnc,frq,exchange,detail,audio\n"
+                "walk,wɔːk,to move on foot,走,,2,1,zk gk,458,358,,,\n"
+                "be,biː,exist,是,,,,,2,,,\n"
+                "expect,ɪkˈspekt,think it will happen,期待,,,,,313,,,\n"
+                "surprise,səˈpraɪz,unexpected event,惊讶,,,,,400,,,\n"
+                "i,aɪ,first person,我,,,,,5,,,\n"
+                "in,ɪn,inside,在里,,,,,10,,,\n"
+                "and,ænd,plus,和,,,,,12,,,\n"
+                "serendipity,,good luck,偶然发现,,,,gre,23199,,,,,\n",
+                encoding="utf-8",
+            )
+            mini_lemma = base / "lemma.en.txt"
+            mini_lemma.write_text("be/100 -> is,was,been\nwalk/1000 -> walked,walking\n", encoding="utf-8")
+            out = base / "ecdic.db"
+            info = dictbuild.build(mini_csv, out, lemma_path=mini_lemma, max_rank=60000)
+            check("构建条目数", info["entries"] >= 8, str(info["entries"]))
+            check("构建走原子替换", out.is_file() and not list(base.glob("*.tmp")))
+
+            dictionary.db_path = lambda: out
+            dictionary.invalidate()
+            check("status 已安装", dictionary.status()["installed"] and dictionary.status()["entries"] >= 8)
+            walked = dictionary.lookup("walked")
+            check("查词回原形", walked["found"] and walked["word"] == "walk", str(walked.get("word")))
+            check("查词带 tag", [t["code"] for t in walked["tags"]] == ["zk", "gk"], str(walked["tags"]))
+            check("查词带变形", "walked" in walked["forms"], str(walked["forms"]))
+            was = dictionary.lookup("was")
+            check("was 词频按 be 算", was["found"] and was["known_rank"] == 2, str(was.get("known_rank")))
+            expected = dictionary.lookup("expected")
+            check("expected 词频按 expect 算", expected["known_rank"] == 313, str(expected.get("known_rank")))
+            missing = dictionary.lookup("zzzznotaword")
+            check("未收录返回 found=false", missing["found"] is False)
+            check("meta 词形还原", dictionary.meta_batch(["studies", "was"])["was"]["lemma"] == "be")
+
+            db.DB_FILE = base / "v.db"
+            db.init_db()
+            pk = db.create_video("https://youtu.be/bbbbbbbbbbb", "bbbbbbbbbbb", "t", "c", 4000, "")
+            db.replace_segments(pk, [Segment(seq=0, start_ms=0, end_ms=4000, text="I walked in and was surprised")])
+            cov = __import__("app.coverage", fromlist=["coverage"]).coverage(pk)
+            check("覆盖率全部已知", cov["coverage"] >= 0.99, str(cov))
+            check("覆盖率带目标值", cov["target"] == 0.98 and cov["baseline_rank"] == 2000)
+    finally:
+        dictionary.db_path = saved_path
+        dictionary.invalidate()
+        db.DB_FILE = saved_db
+
+    print("[15] 网络证书环境（macOS python.org 的 CA 为空时自动回退）")
+    import os
+    import ssl
+
+    from .net import ssl_context
+
+    context = ssl_context()
+    check("HTTPS 上下文能加载根证书", context.cert_store_stats().get("x509_ca", 0) > 0)
+    env_file = os.environ.get("SSL_CERT_FILE")
+    check("证书回退环境变量有效（若设置）", (not env_file) or Path(env_file).is_file(), env_file or "未设置")
+
     print()
     if failures:
         print(f"✗ {len(failures)} 项失败：{', '.join(failures)}")

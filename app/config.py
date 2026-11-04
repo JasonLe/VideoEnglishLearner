@@ -54,9 +54,15 @@ DEFAULTS: dict[str, Any] = {
         "max_ms": 7000,
         "min_ms": 900,
     },
+    "dict": {
+        "db_path": "",
+        "source_url": "https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.csv",
+        "lemma_url": "https://raw.githubusercontent.com/skywind3000/ECDICT/master/lemma.en.txt",
+        "max_rank": 60000,
+    },
 }
 
-_SECTION_ORDER = ("server", "network", "download", "asr", "llm", "segment")
+_SECTION_ORDER = ("server", "network", "download", "asr", "llm", "segment", "dict")
 
 _KEY_ORDER: dict[str, tuple[str, ...]] = {
     "server": ("host", "port"),
@@ -73,6 +79,7 @@ _KEY_ORDER: dict[str, tuple[str, ...]] = {
     ),
     "llm": ("base_url", "api_key", "model", "batch_size", "timeout_ms"),
     "segment": ("max_chars", "target_chars", "max_ms", "min_ms"),
+    "dict": ("db_path", "source_url", "lemma_url", "max_rank"),
 }
 
 _KEY_COMMENT: dict[str, str] = {
@@ -110,6 +117,16 @@ _KEY_COMMENT: dict[str, str] = {
     "segment.target_chars": "切分的理想行长，比上限小一点看起来更稳",
     "segment.max_ms": "一行最长显示时间，超了强制再切",
     "segment.min_ms": "太短的行会闪，切分时尽量避免",
+    "dict.db_path": "词典 SQLite 文件路径；留空 = data/dict/ecdic.db（设置页里点「下载并构建」会生成）",
+    "dict.source_url": (
+        "ECDICT 的 ecdict.csv 地址（约 63MB，MIT 协议）；GitHub 慢可以换成镜像\n"
+        "https://github.com/skywind3000/ECDICT"
+    ),
+    "dict.lemma_url": "ECDICT 的 lemma.en.txt 地址（约 2.2MB，词形→原形补充表）",
+    "dict.max_rank": (
+        "词频裁剪档位：只保留 BNC/当代语料排名 <= 该值的词条（外加考试大纲词）。\n"
+        "60000 约 8–15 万词条；调大库更全但体积、内存都涨"
+    ),
 }
 
 _FILE_HEADER = (

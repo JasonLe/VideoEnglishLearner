@@ -160,7 +160,7 @@ FIELDS: list[dict[str, Any]] = [
         "label": "请求超时",
         "type": "int",
         "min": 5000,
-        "max": 600000,
+        "max": 50000,
         "hint": "单次请求超时（毫秒）。本地小模型出字慢，可调到 180000。",
     },
     {
@@ -198,6 +198,30 @@ FIELDS: list[dict[str, Any]] = [
         "min": 200,
         "max": 10000,
         "hint": "太短的行会闪，切分时尽量避免。",
+    },
+    {
+        "group": "词典",
+        "path": "dict.db_path",
+        "label": "词典文件",
+        "type": "path",
+        "placeholder": "留空 = data/dict/ecdic.db",
+        "hint": "本地词典的 SQLite 路径。不填就用默认位置；上面状态卡里的「下载并构建」会生成它。",
+    },
+    {
+        "group": "词典",
+        "path": "dict.source_url",
+        "label": "词库源地址",
+        "type": "text",
+        "hint": "ECDICT 的 ecdict.csv（约 63MB，MIT 协议）。GitHub 慢可以换镜像；改完点「下载并构建」。",
+    },
+    {
+        "group": "词典",
+        "path": "dict.max_rank",
+        "label": "词频裁剪档位",
+        "type": "int",
+        "min": 5000,
+        "max": 60000,
+        "hint": "只保留 BNC/当代语料排名不超过该值的词条（外加考试大纲词）。越大词条越多、库越大；60000 档实测约 5.9 万条 / 14MB，再往上基本饱和（BNC 排名上限 50000）。改完需要重建词典。",
     },
     {
         "group": "服务",
@@ -243,6 +267,12 @@ def _llm_status() -> dict:
     return llm.describe()
 
 
+def _dict_status() -> dict:
+    from . import dict as dictionary
+
+    return dictionary.status()
+
+
 def snapshot() -> dict:
     """设置页需要的全部内容：字段描述 + 当前值 + 默认值 + ffmpeg 现状。"""
     return {
@@ -252,6 +282,7 @@ def snapshot() -> dict:
         "defaults": {field["path"]: _default_of(field["path"]) for field in FIELDS},
         "ffmpeg": _ffmpeg_status(),
         "llm": _llm_status(),
+        "dict": _dict_status(),
     }
 
 
@@ -343,6 +374,9 @@ def apply(values: dict) -> dict:
     # 写完再读一遍，保证内存 = 磁盘（也顺便验证一下刚写的 toml 还能被解析）
     config_mod.reload()
     _invalidate_ffmpeg()
+    from . import dict as dictionary
+
+    dictionary.invalidate()
     return snapshot()
 
 

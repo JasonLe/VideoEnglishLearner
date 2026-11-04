@@ -57,6 +57,21 @@ const state = {
   analysisDoneShown: -1,
   subsMode: "bilingual",
   health: null,
+  // ---- 生词本 / 词典 ----
+  knownVocab: null,      // { learning:Set, known:Set, ignored:Set }，字幕打点用；未拿到时为 null
+  popover: null,         // 查词弹层状态
+  lookupToken: 0,        // 连点不同词时丢弃过期响应
+  dictStatus: null,      // 最近一次 GET /api/dict/status
+  dictStatusError: "",
+  dictTimer: null,
+  dictWasBusy: false,
+  prevView: "library",   // 从哪个视图进的设置（关闭设置后回哪）
+  vocab: {
+    status: "all", q: "", tag: "", sort: "recent",
+    items: [], total: 0, stats: {}, loading: false, loaded: false,
+  },
+  review: null,          // 复习队列 { items, index, revealed, done, submitting }
+  vocabBadge: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -265,13 +280,28 @@ async function loadLibrary() {
 function updateHealth() {
   const el = $("health");
   const active = state.videos.filter((v) => ACTIVE.includes(v.status));
+  const dict = state.health && state.health.dict;
+  let dictText = "";
+  let dictTitle = "";
+  if (dict) {
+    if (dict.installed) {
+      dictText = ` · 词典 ${fmtNumber(dict.entries)}`;
+      dictTitle = `本地词典已安装：${fmtNumber(dict.entries)} 词条`;
+    } else {
+      dictText = " · 词典未装";
+      dictTitle = "本地词典未安装，点「设置 → 词典」下载";
+    }
+  } else {
+    dictTitle = "本地词典状态未知（/api/health 没有 dict 字段）";
+  }
   if (active.length) {
     el.className = "health busy";
-    el.innerHTML = `<span class="dot"></span>处理中 ${active.length}`;
+    el.innerHTML = `<span class="dot"></span>处理中 ${active.length}${esc(dictText)}`;
   } else {
     el.className = "health ok";
-    el.innerHTML = `<span class="dot"></span>就绪`;
+    el.innerHTML = `<span class="dot"></span>就绪${esc(dictText)}`;
   }
+  el.title = dictTitle;
 }
 
 function hasRunningAnalysis() {
@@ -383,6 +413,15 @@ function showView(name) {
   $("library-view").classList.toggle("hidden", name !== "library");
   $("player-view").classList.toggle("hidden", name !== "player");
   $("settings-view").classList.toggle("hidden", name !== "settings");
+  $("vocab-view").classList.toggle("hidden", name !== "vocab");
+  if (name !== "player") closeWordPopover();
+  if (name !== "vocab") closeReview();
+  if (name !== "settings") stopDictPoll();
+  // 顶栏导航高亮当前视图
+  const navLibrary = $("nav-library");
+  const navVocab = $("nav-vocab");
+  if (navLibrary) navLibrary.classList.toggle("on", name === "library");
+  if (navVocab) navVocab.classList.toggle("on", name === "vocab");
 }
 
 async function openVideo(pk, quiet = false) {
@@ -404,6 +443,9 @@ async function openVideo(pk, quiet = false) {
   state.current = video;
   state.segments = subs.segments || [];
   state.activeIdx = -1;
+  state.knownVocab = null;
+  closeWordPopover();
+  closeReview();
   clearWordHighlight();
   state.seekLine = -1;
   state.ab = { a: null, b: null };
@@ -435,6 +477,8 @@ async function openVideo(pk, quiet = false) {
   renderSubtitles();
   renderAnalysisPanel(-1);
   showView("player");
+  // 字幕生词标记：加载视频后拉一次已知词，异步补上 .saved，失败静默
+  loadKnownVocab();
 
   // 焦点可能还停在添加框、卡片按钮或设置控件上：不清掉的话空格会先被它们吃掉
   if (
@@ -478,6 +522,9 @@ function backToLibrary() {
   el.removeAttribute("src");
   el.load();
   stopAnalysisPoll();
+  closeWordPopover();
+  closeReview();
+  state.knownVocab = null;
   state.current = null;
   state.segments = [];
   state.analysis = null;
@@ -505,12 +552,34 @@ function appendWords(container, words, highlightIndex = -1) {
     const span = document.createElement("span");
     span.className = "w";
     if (i === highlightIndex) span.classList.add("on");
+    // 生词本里 learning 的词：虚线下划线打点。只加类，不改字幕文本
+    if (isLearningWord(w.text)) span.classList.add("saved");
     span.textContent = w.text;
     container.appendChild(span);
     spans.push(span);
     prev = w.text;
   });
   return spans;
+}
+
+/** 重新应用字幕生词标记（/api/vocab/known 晚到、收藏/掌握后立即刷新用） */
+function applySavedMarks() {
+  state.lineEls.forEach((item) => {
+    const idx = Number(item.el.dataset.i);
+    const seg = state.segments[idx];
+    const words = seg ? wordListFor(seg) : [];
+    item.spans.forEach((span, wi) => {
+      const w = words[wi];
+      span.classList.toggle("saved", Boolean(w) && isLearningWord(w.text));
+    });
+  });
+  if (state.nowSpans && state.nowSpans.length && state.activeIdx >= 0 && state.segments[state.activeIdx]) {
+    const words = wordListFor(state.segments[state.activeIdx]);
+    state.nowSpans.forEach((span, wi) => {
+      const w = words[wi];
+      span.classList.toggle("saved", Boolean(w) && isLearningWord(w.text));
+    });
+  }
 }
 
 /** 当前视频某一句的解析条目（后端 items 以 seq 为键） */
@@ -604,6 +673,8 @@ function setActiveLine(idx) {
   if (prev) prev.el.classList.remove("on");
 
   state.activeIdx = idx;
+  // 切到别的行了：查词卡跟着关掉（它还钉在上一行的词旁边）
+  if (state.popover) closeWordPopover();
   clearWordHighlight();
   const now = $("now-line");
   now.innerHTML = "";
@@ -877,6 +948,7 @@ async function refreshHealth() {
     return state.health;
   }
   renderTaskBar();
+  updateHealth();
   return state.health;
 }
 
@@ -1175,9 +1247,1295 @@ function revealLine(line) {
   line._revealTimer = setTimeout(() => line.classList.remove("reveal"), 5000);
 }
 
+/* ------------------------------------------------------------ 词典 / 生词本 */
+
+/* 后端 tags 给的是 [{code,label}]，label 已是中文；这里只兜底常见 code → 中文 */
+const TAG_LABELS = {
+  zk: "中考", gk: "高考", cet4: "四级", cet6: "六级", ky: "考研",
+  toefl: "托福", ielts: "雅思", gre: "GRE", gmat: "GMAT",
+};
+const VOCAB_STATUS_TEXT = { learning: "学习中", known: "已掌握", ignored: "已忽略" };
+const VOCAB_TABS = [
+  ["all", "全部"],
+  ["learning", "学习中"],
+  ["known", "已掌握"],
+  ["ignored", "已忽略"],
+];
+const VOCAB_PAGE = 50;
+
+function fmtNumber(n) {
+  if (n === null || n === undefined || n === "") return "—";
+  const v = Number(n);
+  if (!Number.isFinite(v)) return String(n);
+  return v.toLocaleString("zh-CN");
+}
+
+function fmtBytes(bytes) {
+  const v = Number(bytes);
+  if (!Number.isFinite(v) || v <= 0) return "0 MB";
+  const mb = v / 1024 / 1024;
+  if (mb < 1024) return `${mb >= 10 ? Math.round(mb) : mb.toFixed(1)} MB`;
+  return `${(mb / 1024).toFixed(2)} GB`;
+}
+
+/** 后端的时间可能是 ISO 字符串，也可能是秒/毫秒时间戳，统一显示成本地时间 */
+function fmtDateTime(value) {
+  if (value === null || value === undefined || value === "") return "";
+  let d;
+  if (typeof value === "number") d = new Date(value < 1e12 ? value * 1000 : value);
+  else d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** 收藏/查词比较用的词形键：小写、去标点、去所有格。和字幕里的词形做精确匹配 */
+function wordKey(text) {
+  let s = String(text === null || text === undefined ? "" : text)
+    .toLowerCase()
+    .replace(/[’`]/g, "'");
+  s = s.replace(/^[^a-z']+|[^a-z']+$/g, "");
+  if (s.endsWith("'s")) s = s.slice(0, -2);
+  return s;
+}
+
+/** 这个字幕词是不是生词本里 learning 的词（known/ignored 不打点） */
+function isLearningWord(text) {
+  const key = wordKey(text);
+  if (!key || !state.knownVocab) return false;
+  return state.knownVocab.learning.has(key);
+}
+
+function normalizeKnownSet(list) {
+  const set = new Set();
+  for (const w of list || []) {
+    const text = typeof w === "string" ? w : (w && (w.word || w.lemma)) || "";
+    const key = wordKey(text);
+    if (key) set.add(key);
+  }
+  return set;
+}
+
+/** 拉一次 /api/vocab/known：把 learning 词标到字幕上。失败静默，不影响播放 */
+async function loadKnownVocab() {
+  let data;
+  try {
+    data = await api("/vocab/known");
+  } catch (_) {
+    return;
+  }
+  state.knownVocab = {
+    learning: normalizeKnownSet(data && data.learning),
+    known: normalizeKnownSet(data && data.known),
+    ignored: normalizeKnownSet(data && data.ignored),
+  };
+  // 后端附带该词的变形（walked/walking…），这样字幕里屈折形式也能一起打点
+  for (const form of (data && data.forms) || []) {
+    const key = wordKey(form);
+    if (key) state.knownVocab.learning.add(key);
+  }
+  applySavedMarks();
+}
+
+/* ---------------------------------------------------------- 生词本徽标 */
+
+function setVocabBadge(n) {
+  const badge = $("vocab-badge");
+  const count = Math.max(0, Number(n) || 0);
+  state.vocabBadge = count;
+  if (!badge) return;
+  if (count > 0) {
+    badge.textContent = count > 99 ? "99+" : String(count);
+    badge.classList.remove("hidden");
+  } else {
+    badge.textContent = "0";
+    badge.classList.add("hidden");
+  }
+}
+
+async function refreshVocabBadge() {
+  try {
+    const data = await api("/vocab?status=due&limit=1&offset=0&sort=due");
+    const stats = (data && data.stats) || {};
+    setVocabBadge(stats.due_now != null ? stats.due_now : 0);
+  } catch (_) {
+    /* 后端没起或接口还没实现：不显示徽标即可 */
+  }
+}
+
+/* ------------------------------------------------------------ 查词弹层 */
+
+function tagChipsHtml(tags) {
+  if (!Array.isArray(tags) || !tags.length) return "";
+  const chips = [];
+  for (const t of tags) {
+    const code = typeof t === "string" ? t : (t && (t.code || t.label)) || "";
+    const label = (t && typeof t === "object" && t.label) || TAG_LABELS[String(code).toLowerCase()] || code;
+    if (!label) continue;
+    chips.push(`<span class="tag-chip">${esc(label)}</span>`);
+  }
+  return chips.length ? `<span class="tag-chips">${chips.join("")}</span>` : "";
+}
+
+function openWordPopover(wordEl, seg, idx, wi) {
+  const words = wordListFor(seg);
+  const w = words[wi];
+  if (!w) return;
+  const text = String(w.text || "").trim();
+  const key = wordKey(text);
+  if (!key) return;
+  state.popover = {
+    word: text,
+    sentence: String(seg.text || words.map((x) => x.text).join(" ")),
+    pk: state.current ? state.current.id : null,
+    seq: seg.seq !== undefined && seg.seq !== null ? seg.seq : idx,
+    startMs: Number(w.start_ms) || 0,
+    rect: wordEl.getBoundingClientRect(),
+    data: null,
+    status: null,
+    vocabId: null,
+    loading: true,
+    error: "",
+    needDict: false,
+    explain: null,
+    explainLoading: false,
+    explainError: "",
+  };
+  renderWordPopover();
+  const token = ++state.lookupToken;
+  lookupWord(token);
+}
+
+function closeWordPopover() {
+  const el = $("word-popover");
+  const overlay = $("popover-overlay");
+  if (el) {
+    el.classList.add("hidden");
+    el.classList.remove("sheet");
+    el.innerHTML = "";
+    el.style.left = "";
+    el.style.top = "";
+  }
+  if (overlay) overlay.classList.add("hidden");
+  state.popover = null;
+  state.lookupToken += 1;
+}
+
+async function lookupWord(token) {
+  const p = state.popover;
+  if (!p) return;
+  const params = new URLSearchParams({ q: p.word });
+  if (p.pk !== null && p.pk !== undefined) params.set("pk", String(p.pk));
+  if (p.seq !== null && p.seq !== undefined) params.set("seq", String(p.seq));
+  let data = null;
+  let error = "";
+  let needDict = false;
+  try {
+    data = await api(`/dict/lookup?${params.toString()}`);
+  } catch (err) {
+    error = err && err.message ? err.message : "查词失败";
+    needDict = err && (err.status === 404 || err.status === 503) || /未安装|not installed|不存在|词典/i.test(error);
+  }
+  if (token !== state.lookupToken || state.popover !== p) return;
+  p.loading = false;
+  p.error = error;
+  p.needDict = Boolean(needDict);
+  if (data && data.installed === false) {
+    // 词典没装时后端仍返回 200 + {found:false,installed:false}：当成「去装词典」处理
+    p.needDict = true;
+    p.error = data.message || "本地词典未安装，请到设置页「词典」里下载";
+  } else if (data) {
+    p.data = data;
+    const found = Boolean(data.found);
+    p.status = found ? data.status || null : null;
+    p.vocabId = found ? data.vocab_id || null : null;
+    if (found && data.word) p.word = String(data.word);
+  }
+  renderWordPopover();
+}
+
+function retryLookup() {
+  const p = state.popover;
+  if (!p) return;
+  p.loading = true;
+  p.error = "";
+  p.needDict = false;
+  renderWordPopover();
+  lookupWord(++state.lookupToken);
+}
+
+function positionWordPopover() {
+  const el = $("word-popover");
+  if (!el || el.classList.contains("hidden")) return;
+  const p = state.popover;
+  const narrow = window.innerWidth <= 640;
+  const rect = p && p.rect ? p.rect : null;
+  if (narrow || !rect) {
+    el.classList.add("sheet");
+    el.style.left = "";
+    el.style.top = "";
+    return;
+  }
+  el.classList.remove("sheet");
+  el.style.left = "0px";
+  el.style.top = "0px";
+  const width = el.offsetWidth;
+  const height = el.offsetHeight;
+  const margin = 10;
+  let left = rect.left + rect.width / 2 - width / 2;
+  left = Math.max(margin, Math.min(window.innerWidth - width - margin, left));
+  let top = rect.bottom + 8;
+  if (top + height + margin > window.innerHeight) top = rect.top - height - 8;
+  top = Math.max(margin, Math.min(window.innerHeight - height - margin, top));
+  el.style.left = `${Math.round(left)}px`;
+  el.style.top = `${Math.round(top)}px`;
+}
+
+function speakWord(text) {
+  const word = String(text || "").trim();
+  if (!word) return;
+  if (!("speechSynthesis" in window)) {
+    toast("这个浏览器不支持语音朗读", "");
+    return;
+  }
+  try {
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(word);
+    utter.lang = "en-US";
+    utter.rate = 0.95;
+    window.speechSynthesis.speak(utter);
+  } catch (_) {
+    toast("朗读失败", "err");
+  }
+}
+
+function explainHtml(ex) {
+  if (!ex || typeof ex !== "object") return "";
+  const parts = [];
+  if (ex.meaning) parts.push(`<div class="wp-explain-sec"><h4>意思</h4><p>${esc(ex.meaning)}</p></div>`);
+  if (ex.usage) parts.push(`<div class="wp-explain-sec"><h4>用法</h4><p>${esc(ex.usage)}</p></div>`);
+  if (Array.isArray(ex.collocations) && ex.collocations.length) {
+    const rows = ex.collocations
+      .map((c) => {
+        const phrase = (c && (c.phrase || c.text)) || "";
+        const meaning = (c && c.meaning) || "";
+        if (!phrase && !meaning) return "";
+        return `<li><b>${esc(phrase)}</b>${meaning ? ` — ${esc(meaning)}` : ""}</li>`;
+      })
+      .filter(Boolean);
+    if (rows.length) parts.push(`<div class="wp-explain-sec"><h4>搭配</h4><ul>${rows.join("")}</ul></div>`);
+  }
+  if (ex.grammar) parts.push(`<div class="wp-explain-sec"><h4>语法</h4><p>${esc(ex.grammar)}</p></div>`);
+  if (Array.isArray(ex.examples) && ex.examples.length) {
+    const rows = ex.examples
+      .map((x) => {
+        if (!x) return "";
+        const en = x.en || x.en_text || "";
+        const zh = x.zh || x.zh_text || "";
+        return `<li><span class="wp-ex-en">${esc(en)}</span><span class="wp-ex-zh dim">${esc(zh)}</span></li>`;
+      })
+      .filter(Boolean);
+    if (rows.length) parts.push(`<div class="wp-explain-sec"><h4>例句</h4><ul class="wp-examples">${rows.join("")}</ul></div>`);
+  }
+  if (ex.note) parts.push(`<div class="wp-explain-sec"><h4>备注</h4><p>${esc(ex.note)}</p></div>`);
+  return parts.length ? parts.join("") : `<p class="dim">模型没有返回内容</p>`;
+}
+
+function renderWordPopover() {
+  const el = $("word-popover");
+  const overlay = $("popover-overlay");
+  if (!el) return;
+  const p = state.popover;
+  if (!p) {
+    el.classList.add("hidden");
+    el.innerHTML = "";
+    if (overlay) overlay.classList.add("hidden");
+    return;
+  }
+  const d = p.data || {};
+  const found = Boolean(d.found);
+  const word = found && d.word ? d.word : p.word;
+  const phonetic = found ? d.phonetic || "" : "";
+  const lemma = found ? d.lemma || "" : "";
+  const status = p.status || (found ? d.status : null);
+  const tags = found ? d.tags : null;
+
+  let html = `<div class="wp-head"><div class="wp-title-row">`;
+  html += `<span class="wp-word">${esc(word)}</span>`;
+  if (phonetic) html += `<span class="wp-phon">/${esc(phonetic)}/</span>`;
+  html += `<span class="wp-spacer"></span>`;
+  html += `<button type="button" class="ghost small" data-wp="speak" title="朗读这个词">🔊 发音</button>`;
+  html += `<button type="button" class="icon-btn wp-close" data-wp="close" title="关闭（Esc）">×</button>`;
+  html += `</div>`;
+  if (lemma && String(lemma).toLowerCase() !== String(word).toLowerCase()) {
+    html += `<div class="wp-meta dim">原形：${esc(lemma)}</div>`;
+  }
+  if (found && d.pos) html += `<div class="wp-meta dim">${esc(d.pos)}</div>`;
+  const chips = tagChipsHtml(tags);
+  const statusBadge = status
+    ? `<span class="badge ${status === "known" ? "ready" : status === "ignored" ? "muted" : ""}">${esc(VOCAB_STATUS_TEXT[status] || status)}</span>`
+    : "";
+  if (chips || statusBadge) {
+    html += `<div class="wp-tags">${chips}${statusBadge}</div>`;
+  }
+  html += `</div><div class="wp-body">`;
+
+  if (p.loading) {
+    html += `<p class="dim">查词中…</p>`;
+  } else if (p.error) {
+    html += `<div class="wp-empty"><p>${esc(p.error)}</p>`;
+    html += `<div class="wp-actions">`;
+    if (p.needDict) {
+      html += `<button type="button" class="small primary" data-wp="settings">去设置页下载词典</button>`;
+    } else {
+      html += `<button type="button" class="ghost small" data-wp="retry">重试</button>`;
+    }
+    html += `</div></div>`;
+  } else if (!found) {
+    html += `<div class="wp-empty"><p>本地词典没有收录「${esc(p.word)}」。</p>`;
+    html += `<p class="dim">也可以先把它收藏进生词本，之后补释义。</p>`;
+    html += `<div class="wp-actions"><button type="button" class="small primary" data-wp="collect">收藏生词</button>`;
+    html += `<button type="button" class="ghost small" data-wp="explain">AI 详解</button></div></div>`;
+  } else {
+    const trans = (Array.isArray(d.translations) ? d.translations : [])
+      .map((t) => (typeof t === "string" ? t : (t && (t.translation || t.text || t.zh)) || ""))
+      .filter(Boolean);
+    if (trans.length) html += `<p class="wp-trans">${trans.map((t) => esc(t)).join("；")}</p>`;
+    const defs = (Array.isArray(d.definition) ? d.definition : [])
+      .map((t) => (typeof t === "string" ? t : (t && (t.text || t.definition)) || ""))
+      .filter(Boolean);
+    if (defs.length) html += `<ul class="wp-defs">${defs.slice(0, 4).map((t) => `<li>${esc(t)}</li>`).join("")}</ul>`;
+    const ranks = [];
+    if (d.collins) ranks.push(`柯林斯 ${d.collins}`);
+    if (d.oxford) ranks.push("牛津核心");
+    if (d.bnc) ranks.push(`BNC ${d.bnc}`);
+    if (d.frq) ranks.push(`词频 ${d.frq}`);
+    if (d.known_rank) ranks.push(`难度排名 ${d.known_rank}`);
+    if (ranks.length) html += `<p class="wp-ranks dim">${ranks.map((t) => esc(t)).join(" · ")}</p>`;
+    if (Array.isArray(d.forms) && d.forms.length) {
+      const forms = d.forms
+        .map((f) => (typeof f === "string" ? f : (f && (f.word || f.text)) || ""))
+        .filter(Boolean);
+      if (forms.length) html += `<p class="wp-forms dim">变形：${forms.map((f) => esc(f)).join(" / ")}</p>`;
+    }
+    html += `<div class="wp-actions">`;
+    if (status === "learning") {
+      html += `<span class="wp-state">已在生词本 · 学习中</span>`;
+      html += `<button type="button" class="ghost small" data-wp="known">标为已掌握</button>`;
+    } else if (status === "known") {
+      html += `<span class="wp-state ok">已在生词本 · 已掌握</span>`;
+    } else if (status === "ignored") {
+      html += `<span class="wp-state">已在生词本 · 已忽略</span>`;
+      html += `<button type="button" class="ghost small" data-wp="known">标为已掌握</button>`;
+    } else {
+      html += `<button type="button" class="small primary" data-wp="collect">收藏生词</button>`;
+      html += `<button type="button" class="ghost small" data-wp="known">标为已掌握</button>`;
+    }
+    html += `<button type="button" class="ghost small" data-wp="explain">${p.explain ? "重新生成 AI 详解" : "AI 详解"}</button>`;
+    html += `</div>`;
+  }
+
+  if (p.explainLoading) {
+    html += `<div class="wp-explain"><p class="dim">AI 正在生成详解…</p></div>`;
+  } else if (p.explainError) {
+    html += `<div class="wp-explain"><p class="vocab-err">${esc(p.explainError)}</p>`;
+    html += `<div class="wp-actions"><button type="button" class="ghost small" data-wp="explain">重试</button>`;
+    if (/llm|模型|设置|配置|未配置/i.test(p.explainError)) {
+      html += `<button type="button" class="ghost small" data-wp="settings">去设置页配置 LLM</button>`;
+    }
+    html += `</div></div>`;
+  } else if (p.explain) {
+    html += `<div class="wp-explain">${explainHtml(p.explain)}</div>`;
+  }
+
+  html += `</div>`;
+  el.innerHTML = html;
+  el.classList.remove("hidden");
+  if (overlay) overlay.classList.remove("hidden");
+  positionWordPopover();
+}
+
+function vocabPayloadFromPopover(p, status) {
+  const d = (p && p.data) || {};
+  const word = String(d.word || (p && p.word) || "").trim();
+  const lemma = String(d.lemma || word).trim();
+  const translations = Array.isArray(d.translations)
+    ? d.translations
+        .map((t) => (typeof t === "string" ? t : (t && (t.translation || t.text || t.zh)) || ""))
+        .filter(Boolean)
+    : [];
+  // 接口里 definition 是一个多行字符串（词典 lookup 返回的是数组，这里拼回去）
+  const defs = Array.isArray(d.definition)
+    ? d.definition.map((t) => (typeof t === "string" ? t : "")).filter(Boolean)
+    : [];
+  return {
+    word,
+    lemma,
+    phonetic: d.phonetic || "",
+    pos: d.pos || "",
+    tags: Array.isArray(d.tags) ? d.tags : [],
+    translation: translations.join("；"),
+    definition: defs.join("\n"),
+    status,
+    note: "",
+    source: {
+      pk: p.pk,
+      seq: p.seq,
+      sentence: p.sentence || "",
+      start_ms: p.startMs || 0,
+    },
+  };
+}
+
+/** 收藏进生词本；收藏成功后当前字幕里这个词立即打点 */
+async function collectWord() {
+  const p = state.popover;
+  if (!p) return;
+  const payload = vocabPayloadFromPopover(p, "learning");
+  if (!payload.word) return;
+  let res;
+  try {
+    res = await api("/vocab", { method: "POST", body: JSON.stringify(payload) });
+  } catch (err) {
+    toast(`收藏失败：${err.message}`, "err");
+    return;
+  }
+  if (state.popover === p) {
+    p.status = "learning";
+    p.data = p.data || {};
+    if (res && res.item && res.item.id) p.vocabId = res.item.id;
+    if (res && res.item && res.item.status) p.status = res.item.status;
+    renderWordPopover();
+  }
+  toast(res && res.created === false ? "这个词已经在生词本里了" : "已收藏到生词本", "ok");
+  loadKnownVocab();
+  refreshVocabBadge();
+  if (state.vocab.loaded) loadVocab(true);
+}
+
+/** 标为已掌握：生词本里已有就 PATCH，没有就直接按 known 建一条 */
+async function markWordKnown() {
+  const p = state.popover;
+  if (!p) return;
+  try {
+    if (p.vocabId) {
+      const res = await api(`/vocab/${p.vocabId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: "known" }),
+      });
+      if (res && res.item && res.item.id) p.vocabId = res.item.id;
+    } else {
+      const payload = vocabPayloadFromPopover(p, "known");
+      if (!payload.word) return;
+      const res = await api("/vocab", { method: "POST", body: JSON.stringify(payload) });
+      if (res && res.item && res.item.id) p.vocabId = res.item.id;
+    }
+  } catch (err) {
+    toast(`操作失败：${err.message}`, "err");
+    return;
+  }
+  p.status = "known";
+  if (p.data) p.data.status = "known";
+  if (state.popover === p) renderWordPopover();
+  toast("已标为掌握，不再进入复习", "ok");
+  loadKnownVocab();
+  refreshVocabBadge();
+  if (state.vocab.loaded) loadVocab(true);
+}
+
+async function explainWord() {
+  const p = state.popover;
+  if (!p || p.explainLoading) return;
+  p.explainLoading = true;
+  p.explainError = "";
+  renderWordPopover();
+  let res;
+  try {
+    res = await api("/dict/explain", {
+      method: "POST",
+      body: JSON.stringify({
+        word: (p.data && p.data.word) || p.word,
+        lemma: (p.data && p.data.lemma) || p.word,
+        sentence: p.sentence || "",
+        pk: p.pk,
+        seq: p.seq,
+      }),
+    });
+  } catch (err) {
+    if (state.popover !== p) return;
+    p.explainLoading = false;
+    p.explainError = err && err.message ? err.message : "AI 详解失败";
+    renderWordPopover();
+    return;
+  }
+  if (state.popover !== p) return;
+  p.explainLoading = false;
+  p.explain = (res && res.explanation) || res || null;
+  renderWordPopover();
+}
+
+/* ------------------------------------------------------------ 生词本视图 */
+
+let vocabLoadToken = 0;
+
+function openVocabView() {
+  // 从播放页切过来：把视频停掉（播放进度会保存），别让声音继续放
+  if (state.current) {
+    backToLibrary();
+  }
+  showView("vocab");
+  refreshVocabBadge();
+  loadVocab(true);
+}
+
+function openLibraryView() {
+  if (state.current) {
+    backToLibrary();
+    return;
+  }
+  showView("library");
+  loadHealth();
+  loadLibrary();
+}
+
+/** 从生词本跳回视频并定位到出现句 */
+async function openVideoAt(pk, seq, startMs) {
+  if (!Number.isFinite(Number(pk))) return;
+  closeReview();
+  await openVideo(Number(pk), true);
+  if (!state.current || Number(state.current.id) !== Number(pk)) return;
+  let idx = -1;
+  if (Number.isFinite(Number(seq))) {
+    idx = state.segments.findIndex((s) => Number(s.seq) === Number(seq));
+  }
+  if (idx < 0 && Number.isFinite(Number(startMs))) idx = idxForTime(Number(startMs));
+  const ms = Number.isFinite(Number(startMs)) && Number(startMs) > 0
+    ? Number(startMs)
+    : idx >= 0 ? state.segments[idx].start_ms : 0;
+  const el = $("video");
+  const go = () => {
+    try {
+      el.currentTime = Math.max(0, ms / 1000);
+    } catch (_) { /* 元数据还没好就算了 */ }
+    if (idx >= 0) {
+      state.seekLine = idx;
+      setActiveLine(idx);
+    }
+    el.play().catch(() => {});
+  };
+  if (el.readyState >= 1) go();
+  else el.addEventListener("loadedmetadata", go, { once: true });
+}
+
+async function loadVocab(reset = false) {
+  const v = state.vocab;
+  const token = ++vocabLoadToken;
+  const offset = reset ? 0 : v.items.length;
+  if (reset) {
+    v.items = [];
+    v.total = 0;
+    v.loaded = false;
+  }
+  v.loading = true;
+  if (reset) renderVocabList();
+  const params = new URLSearchParams({
+    status: v.status,
+    limit: String(VOCAB_PAGE),
+    offset: String(offset),
+    sort: v.sort || "recent",
+  });
+  if (v.q.trim()) params.set("q", v.q.trim());
+  if (v.tag) params.set("tag", v.tag);
+  let data;
+  try {
+    data = await api(`/vocab?${params.toString()}`);
+  } catch (err) {
+    if (token !== vocabLoadToken) return;
+    v.loading = false;
+    renderVocabList();
+    toast(`读取生词本失败：${err.message}`, "err");
+    return;
+  }
+  if (token !== vocabLoadToken) return;
+  v.items = reset ? data.items || [] : v.items.concat(data.items || []);
+  v.total = Number(data.total) || 0;
+  v.stats = data.stats || {};
+  v.loaded = true;
+  v.loading = false;
+  setVocabBadge(v.stats.due_now != null ? v.stats.due_now : 0);
+  renderVocabStats();
+  renderVocabTabs();
+  renderVocabTagOptions();
+  renderVocabList();
+}
+
+function renderVocabStats() {
+  const box = $("vocab-stats");
+  if (!box) return;
+  const s = state.vocab.stats || {};
+  const cells = [
+    ["总词数", s.all],
+    ["学习中", s.learning],
+    ["待复习", s.due_now],
+    ["今日已复习", s.reviews_today],
+    ["连续天数", s.streak_days],
+  ];
+  box.innerHTML = cells
+    .map(
+      ([label, value]) =>
+        `<div class="vocab-stat"><div class="vocab-stat-num">${esc(fmtNumber(value))}</div><div class="vocab-stat-label">${esc(label)}</div></div>`
+    )
+    .join("");
+  const total = $("vocab-total");
+  if (total) total.textContent = state.vocab.loaded ? `共 ${fmtNumber(state.vocab.total)} 个` : "";
+}
+
+function renderVocabTabs() {
+  const box = $("vocab-tabs");
+  if (!box) return;
+  box.innerHTML = VOCAB_TABS.map(
+    ([value, label]) =>
+      `<button type="button" class="vocab-tab${state.vocab.status === value ? " on" : ""}" data-status="${esc(value)}">${esc(label)}</button>`
+  ).join("");
+}
+
+function renderVocabTagOptions() {
+  const sel = $("vocab-tag");
+  if (!sel) return;
+  const map = new Map();
+  for (const item of state.vocab.items) {
+    for (const t of item.tags || []) {
+      const code = typeof t === "string" ? t : (t && (t.code || t.label)) || "";
+      const label = (t && typeof t === "object" && t.label) || TAG_LABELS[String(code).toLowerCase()] || code;
+      if (code && !map.has(String(code))) map.set(String(code), String(label || code));
+    }
+  }
+  const current = state.vocab.tag || "";
+  if (current && !map.has(current)) map.set(current, TAG_LABELS[current] || current);
+  const opts = [`<option value="">全部 tag</option>`];
+  for (const [code, label] of map) opts.push(`<option value="${esc(code)}">${esc(label)}</option>`);
+  sel.innerHTML = opts.join("");
+  sel.value = current;
+}
+
+function vocabDueText(item) {
+  const d = Number(item && item.due_in_days);
+  if (!Number.isFinite(d)) return { text: "", cls: "" };
+  if (d <= 0) return { text: "今天到期", cls: "due-now" };
+  if (d === 1) return { text: "明天到期", cls: "" };
+  return { text: `${d} 天后到期`, cls: "" };
+}
+
+function vocabRowHtml(item) {
+  const status = item.status || "learning";
+  const due = status === "learning" ? vocabDueText(item) : { text: "", cls: "" };
+  const word = item.word || item.lemma || "";
+  const parts = [];
+  parts.push(`<div class="vocab-row" data-id="${esc(item.id)}">`);
+  parts.push(`<div class="vocab-main">`);
+  parts.push(`<div class="vocab-wordline">`);
+  parts.push(`<span class="vocab-word">${esc(word)}</span>`);
+  if (item.phonetic) parts.push(`<span class="vocab-phon">/${esc(item.phonetic)}/</span>`);
+  if (item.pos) parts.push(`<span class="vocab-pos dim">${esc(item.pos)}</span>`);
+  parts.push(`<span class="badge ${status === "known" ? "ready" : status === "ignored" ? "muted" : ""}">${esc(VOCAB_STATUS_TEXT[status] || status)}</span>`);
+  if (due.text) parts.push(`<span class="vocab-due ${esc(due.cls)}">${esc(due.text)}</span>`);
+  parts.push(`</div>`);
+  parts.push(`<div class="vocab-zh">${esc(item.translation || "（没有释义）")}</div>`);
+  const chips = tagChipsHtml(item.tags);
+  if (chips || item.source_title) {
+    parts.push(`<div class="vocab-meta">`);
+    if (chips) parts.push(chips);
+    if (item.source_title) parts.push(`<span class="vocab-src dim" title="${esc(item.source_title)}">${esc(item.source_title)}</span>`);
+    parts.push(`</div>`);
+  }
+  parts.push(`<div class="vocab-occ hidden"></div>`);
+  parts.push(`</div>`);
+  parts.push(`<div class="vocab-actions">`);
+  if (status !== "known") {
+    parts.push(`<button type="button" class="ghost small" data-vact="known">标已掌握</button>`);
+  }
+  parts.push(`<button type="button" class="ghost small" data-vact="occ">出现句</button>`);
+  parts.push(`<button type="button" class="ghost small danger" data-vact="delete">删除</button>`);
+  parts.push(`</div>`);
+  parts.push(`</div>`);
+  return parts.join("");
+}
+
+function renderVocabList() {
+  const list = $("vocab-list");
+  const more = $("vocab-more");
+  if (!list) return;
+  const v = state.vocab;
+  if (!v.items.length) {
+    let text = "生词本还是空的：在播放页点字幕里的单词，就能收藏进来。";
+    if (v.loading) text = "加载中…";
+    else if (v.q.trim() || v.tag || v.status !== "all") text = "没有符合条件的生词。";
+    list.innerHTML = `<p class="vocab-empty dim">${esc(text)}</p>`;
+  } else {
+    list.innerHTML = v.items.map(vocabRowHtml).join("");
+  }
+  if (more) more.classList.toggle("hidden", !(v.items.length < v.total));
+}
+
+async function patchVocabStatus(item, status) {
+  try {
+    const res = await api(`/vocab/${item.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status }),
+    });
+    if (res && res.item) Object.assign(item, res.item);
+  } catch (err) {
+    toast(`更新失败：${err.message}`, "err");
+    return;
+  }
+  toast(status === "known" ? "已标为掌握，不再复习" : "已更新", "ok");
+  if (state.vocab.status !== "all" && state.vocab.status !== status) loadVocab(true);
+  else renderVocabList();
+  loadKnownVocab();
+  refreshVocabBadge();
+}
+
+async function deleteVocabItem(item) {
+  const name = item.word || item.lemma || "这个词";
+  if (!confirm(`从生词本删除「${name}」？`)) return;
+  try {
+    await api(`/vocab/${item.id}`, { method: "DELETE" });
+  } catch (err) {
+    toast(`删除失败：${err.message}`, "err");
+    return;
+  }
+  toast("已删除", "ok");
+  loadVocab(true);
+  loadKnownVocab();
+  refreshVocabBadge();
+}
+
+async function toggleOccurrences(row, item) {
+  const box = row.querySelector(".vocab-occ");
+  if (!box) return;
+  if (!box.classList.contains("hidden")) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  box.classList.remove("hidden");
+  box.innerHTML = `<p class="dim">读取出现位置…</p>`;
+  let data;
+  try {
+    data = await api(`/vocab/${item.id}/occurrences`);
+  } catch (err) {
+    box.innerHTML = `<p class="vocab-err">读取失败：${esc(err.message)}</p>`;
+    return;
+  }
+  const items = (data && data.items) || [];
+  if (!items.length) {
+    box.innerHTML = `<p class="dim">没有找到可跳转的出现位置。</p>`;
+    return;
+  }
+  const rows = items.map((o) => {
+    const pk = o.pk != null ? o.pk : o.video_pk;
+    const ms = o.start_ms != null ? o.start_ms : 0;
+    return `<button type="button" class="occ-item" data-pk="${esc(pk)}" data-seq="${esc(o.seq)}" data-ms="${esc(ms)}" title="在视频里定位到这一句">
+      <span class="occ-title dim">${esc(o.title || `视频 ${pk}`)}</span>
+      <span class="occ-text">${esc(o.text || "")}</span>
+    </button>`;
+  });
+  box.innerHTML =
+    rows.join("") + (data && data.truncated ? `<p class="dim small">只显示前 ${items.length} 条</p>` : "");
+}
+
+function onVocabListClick(e) {
+  const occ = e.target.closest("[data-pk]");
+  if (occ && occ.classList.contains("occ-item")) {
+    openVideoAt(Number(occ.dataset.pk), Number(occ.dataset.seq), Number(occ.dataset.ms));
+    return;
+  }
+  const btn = e.target.closest("[data-vact]");
+  if (!btn) return;
+  const row = btn.closest(".vocab-row");
+  if (!row) return;
+  const id = Number(row.dataset.id);
+  const item = state.vocab.items.find((x) => Number(x.id) === id);
+  if (!item) return;
+  const act = btn.dataset.vact;
+  if (act === "known") patchVocabStatus(item, "known");
+  else if (act === "delete") deleteVocabItem(item);
+  else if (act === "occ") toggleOccurrences(row, item);
+}
+
+function exportVocab(format) {
+  const fmt = ["tsv", "csv", "json"].includes(format) ? format : "tsv";
+  // 后端直接回文件；交给浏览器下载，不走 fetch（避免把文件读进内存）
+  window.location = `${API}/vocab/export?format=${fmt}`;
+  toast(`正在导出 ${fmt.toUpperCase()}${fmt === "tsv" ? "（可直接导入 Anki）" : ""}`, "");
+}
+
+/* ------------------------------------------------------------ 复习模式 */
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** 来源句把目标词挖空；revealed 时显示原词。返回的是已转义的 HTML */
+function reviewCloze(item, revealed) {
+  const raw = String((item && item.source_sentence) || "").trim();
+  const word = String((item && (item.word || item.lemma)) || "").trim();
+  if (!raw) return `<span class="dim">（这个词没有记录来源句）</span>`;
+  if (!word) return `<span class="review-plain">${esc(raw)}</span>`;
+  const forms = [word];
+  if (item.lemma && String(item.lemma).toLowerCase() !== word.toLowerCase()) forms.push(String(item.lemma));
+  const pattern = new RegExp(
+    `(?<![A-Za-z])(${forms.map(escapeRegExp).join("|")})(?![A-Za-z])`,
+    "i"
+  );
+  const m = raw.match(pattern);
+  if (!m) return `<span class="review-plain">${esc(raw)}</span>`;
+  const before = raw.slice(0, m.index);
+  const after = raw.slice(m.index + m[0].length);
+  const hit = revealed
+    ? `<span class="review-answer">${esc(m[0])}</span>`
+    : `<span class="review-blank">＿＿＿</span>`;
+  return `${esc(before)}${hit}${esc(after)}`;
+}
+
+async function startReview() {
+  let data;
+  try {
+    data = await api("/vocab?status=due&limit=50&offset=0&sort=due");
+  } catch (err) {
+    toast(`读取待复习生词失败：${err.message}`, "err");
+    return;
+  }
+  const items = (data && data.items) || [];
+  if (!items.length) {
+    toast("现在没有到期的生词，先去播放页收藏几个吧", "");
+    return;
+  }
+  showView("vocab");
+  state.review = {
+    items,
+    index: 0,
+    revealed: false,
+    submitting: false,
+    done: false,
+    graded: 0,
+    error: "",
+  };
+  renderReview();
+}
+
+function closeReview() {
+  const modal = $("review-modal");
+  const had = state.review;
+  if (modal) {
+    modal.classList.add("hidden");
+    modal.innerHTML = "";
+  }
+  document.body.classList.remove("modal-open");
+  state.review = null;
+  if (had && had.graded > 0) {
+    refreshVocabBadge();
+    if (state.vocab.loaded) loadVocab(true);
+  }
+}
+
+function renderReviewDone(r) {
+  return `<div class="review-box review-done">
+    <div class="review-head"><span class="dim">生词复习</span><span class="wp-spacer"></span>
+      <button type="button" class="icon-btn" data-review="close" title="关闭（Esc）">×</button></div>
+    <h3>这一轮复习完成</h3>
+    <p class="dim">复习了 ${esc(String(r.graded))} 个词。</p>
+    <div class="review-actions"><button type="button" class="primary" data-review="close">完成</button></div>
+  </div>`;
+}
+
+function renderReview() {
+  const modal = $("review-modal");
+  const r = state.review;
+  if (!modal) return;
+  if (!r) {
+    modal.classList.add("hidden");
+    modal.innerHTML = "";
+    document.body.classList.remove("modal-open");
+    return;
+  }
+  modal.classList.remove("hidden");
+  document.body.classList.add("modal-open");
+  if (r.done) {
+    modal.innerHTML = renderReviewDone(r);
+    return;
+  }
+  const item = r.items[r.index];
+  if (!item) {
+    closeReview();
+    return;
+  }
+  const total = r.items.length;
+  const left = total - r.index;
+  const word = item.word || item.lemma || "";
+  const tags = tagChipsHtml(item.tags);
+  const gradeRow = `<div class="review-grades">
+    <button type="button" class="grade g1" data-review="grade" data-grade="1"><b>1</b><span>忘了</span></button>
+    <button type="button" class="grade g2" data-review="grade" data-grade="2"><b>2</b><span>模糊</span></button>
+    <button type="button" class="grade g3" data-review="grade" data-grade="3"><b>3</b><span>记得</span></button>
+    <button type="button" class="grade g4" data-review="grade" data-grade="4"><b>4</b><span>熟练</span></button>
+  </div>`;
+  let html = `<div class="review-box">
+    <div class="review-head">
+      <span class="dim">生词复习</span>
+      <span class="wp-spacer"></span>
+      <span class="review-count">${esc(String(r.index + 1))} / ${esc(String(total))}</span>
+      <span class="review-left dim">剩余 ${esc(String(left))}</span>
+      <button type="button" class="icon-btn" data-review="close" title="关闭（Esc）">×</button>
+    </div>
+    <div class="review-progress"><i style="width:${clampPct((r.index / Math.max(1, total)) * 100)}%"></i></div>
+    <p class="review-source">${reviewCloze(item, r.revealed)}</p>
+    <div class="review-wordrow">
+      <span class="review-word">${esc(word)}</span>
+      ${item.phonetic ? `<span class="review-phon">/${esc(item.phonetic)}/</span>` : ""}
+      ${item.pos ? `<span class="dim">${esc(item.pos)}</span>` : ""}
+      ${tags}
+    </div>`;
+  if (r.revealed) {
+    html += `<p class="review-trans">${esc(item.translation || "（没有释义）")}</p>`;
+    if (item.source_title) html += `<p class="review-src dim">来源：${esc(item.source_title)}</p>`;
+    html += `<div class="review-actions">${r.submitting ? `<p class="dim">提交中…</p>` : gradeRow}</div>`;
+  } else {
+    html += `<p class="review-hint dim">按空格或点「显示答案」查看释义</p>`;
+    html += `<div class="review-actions"><button type="button" class="primary" data-review="reveal">显示答案 <kbd>空格</kbd></button></div>`;
+  }
+  if (r.error) html += `<p class="vocab-err">${esc(r.error)}</p>`;
+  html += `</div>`;
+  modal.innerHTML = html;
+}
+
+function revealReview() {
+  const r = state.review;
+  if (!r || r.done || r.revealed) return;
+  r.revealed = true;
+  renderReview();
+}
+
+async function gradeReview(grade) {
+  const r = state.review;
+  if (!r || r.done || r.submitting || !r.revealed) return;
+  const item = r.items[r.index];
+  if (!item) return;
+  const g = Number(grade);
+  if (![1, 2, 3, 4].includes(g)) return;
+  r.submitting = true;
+  r.error = "";
+  renderReview();
+  try {
+    await api(`/vocab/${item.id}/review`, {
+      method: "POST",
+      body: JSON.stringify({ grade: g }),
+    });
+  } catch (err) {
+    r.submitting = false;
+    r.error = `提交评分失败：${err.message}`;
+    renderReview();
+    return;
+  }
+  r.submitting = false;
+  r.graded += 1;
+  if (r.index + 1 >= r.items.length) {
+    r.done = true;
+    renderReview();
+    refreshVocabBadge();
+    if (state.vocab.loaded) loadVocab(true);
+    return;
+  }
+  r.index += 1;
+  r.revealed = false;
+  r.error = "";
+  renderReview();
+}
+
+/** 复习/弹层的键盘：1-4 评分、空格揭示、Esc 关闭 */
+function onOverlayKeydown(e) {
+  const modal = $("review-modal");
+  const popover = $("word-popover");
+  if (modal && !modal.classList.contains("hidden")) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      closeReview();
+      return;
+    }
+    const r = state.review;
+    if (!r || r.done) return;
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") return;
+    if (e.key === " " || e.code === "Space") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!r.revealed) revealReview();
+      return;
+    }
+    if (r.revealed && ["1", "2", "3", "4"].includes(e.key)) {
+      e.preventDefault();
+      e.stopPropagation();
+      gradeReview(Number(e.key));
+    }
+    return;
+  }
+  if (popover && !popover.classList.contains("hidden") && e.key === "Escape") {
+    e.preventDefault();
+    e.stopPropagation();
+    closeWordPopover();
+  }
+}
+
+/* ---------------------------------------------------------- 设置页词典卡 */
+
+function dictBusy(st) {
+  if (!st) return false;
+  return Boolean(st.downloading) || st.phase === "downloading" || st.phase === "building";
+}
+
+function dictPhaseText(st) {
+  if (!st) return "";
+  if (dictBusy(st)) return st.phase === "building" ? "构建词典中" : "下载词典中";
+  return { idle: "未安装", downloading: "下载中", building: "构建中", done: "已就绪", error: "安装失败" }[st.phase] || "";
+}
+
+function renderDictStatusCard() {
+  const card = $("dict-status-card");
+  if (!card) return;
+  const st = state.dictStatus;
+  if (!st) {
+    card.className = "dict-status-card dim";
+    const msg = state.dictStatusError
+      ? `读取词典状态失败：${state.dictStatusError}`
+      : "读取词典状态…";
+    card.innerHTML = `<p class="dict-card-line">${esc(msg)}</p>`;
+    return;
+  }
+  const busy = dictBusy(st);
+  const installed = Boolean(st.installed);
+  const pct = clampPct(st.progress);
+  card.className = `dict-status-card ${busy ? "busy" : installed ? "ok" : st.phase === "error" ? "err" : ""}`;
+  let html = "";
+  if (busy) {
+    const phase = dictPhaseText(st);
+    html += `<div class="dict-card-line"><span class="dot"></span>${esc(phase)}${st.message ? ` · ${esc(st.message)}` : ""} · ${pct}%</div>`;
+    html += `<div class="dict-progress"><i style="width:${pct}%"></i></div>`;
+    html += `<div class="dict-card-actions"><button type="button" class="ghost small" data-dict="refresh">刷新</button></div>`;
+  } else if (installed) {
+    const bits = [`已安装 · ${fmtNumber(st.entries)} 词条`];
+    if (st.forms) bits.push(`${fmtNumber(st.forms)} 词形`);
+    bits.push(fmtBytes(st.size_bytes));
+    if (st.built_at) bits.push(`构建于 ${fmtDateTime(st.built_at)}`);
+    html += `<div class="dict-card-line">${esc(bits.join(" · "))}</div>`;
+    if (st.path) html += `<div class="dict-card-line dim mono">${esc(st.path)}</div>`;
+    html += `<div class="dict-card-actions">`;
+    html += `<button type="button" class="ghost small" data-dict="rebuild">重建</button>`;
+    html += `<button type="button" class="ghost small danger" data-dict="delete">删除</button>`;
+    html += `</div>`;
+  } else if (st.phase === "error") {
+    html += `<div class="dict-card-line vocab-err">安装失败${st.error ? `：${esc(st.error)}` : ""}</div>`;
+    html += `<div class="dict-card-actions"><button type="button" class="small primary" data-dict="install">重试下载</button></div>`;
+  } else {
+    html += `<div class="dict-card-line">本地词典未安装。下载 ECDICT 并构建后，字幕点词就能查音标、释义和考试标签。</div>`;
+    html += `<div class="dict-card-actions"><button type="button" class="small primary" data-dict="install">下载并构建</button></div>`;
+  }
+  card.innerHTML = html;
+}
+
+function handleDictStatus(st) {
+  const wasBusy = state.dictWasBusy;
+  const wasInstalled = Boolean(state.dictStatus && state.dictStatus.installed);
+  state.dictStatus = st || null;
+  state.dictStatusError = "";
+  const busy = dictBusy(st);
+  state.dictWasBusy = busy;
+  if (busy) startDictPoll();
+  else stopDictPoll();
+  if (wasBusy && !busy) {
+    if (st && st.phase === "error") toast(`词典安装失败${st.error ? `：${st.error}` : ""}`, "err");
+    else if (st && st.installed) toast("词典已就绪", "ok");
+  }
+  if (!wasInstalled && st && st.installed) {
+    // 刚装好：补一下字幕打点和生词本数据
+    if (state.current) loadKnownVocab();
+    if (state.vocab.loaded) loadVocab(true);
+  }
+}
+
+async function loadDictStatus() {
+  try {
+    const st = await api("/dict/status");
+    handleDictStatus(st);
+  } catch (err) {
+    state.dictStatusError = err && err.message ? err.message : "读取失败";
+    stopDictPoll();
+  }
+  renderDictStatusCard();
+}
+
+function startDictPoll() {
+  if (state.dictTimer) return;
+  state.dictTimer = setInterval(pollDictStatus, 1000);
+}
+
+function stopDictPoll() {
+  if (state.dictTimer) {
+    clearInterval(state.dictTimer);
+    state.dictTimer = null;
+  }
+}
+
+async function pollDictStatus() {
+  try {
+    const st = await api("/dict/status");
+    handleDictStatus(st);
+  } catch (_) {
+    // 偶发失败保留定时器，下一轮再试
+    return;
+  }
+  renderDictStatusCard();
+}
+
+async function dictInstall(force = false) {
+  if (force && !confirm("重新下载并构建词典？当前的词典文件会被覆盖，构建期间不能查词。")) return;
+  try {
+    // body 可省；force 重建时才带 {"force": true}
+    await api("/dict/install", force ? { method: "POST", body: JSON.stringify({ force: true }) } : { method: "POST" });
+  } catch (err) {
+    if (err.status === 409) {
+      toast("词典正在下载或构建中，请稍候", "");
+      loadDictStatus();
+    } else {
+      toast(`开始下载失败：${err.message}`, "err");
+    }
+    return;
+  }
+  toast(force ? "已开始重建词典" : "已开始下载词典", "ok");
+  state.dictWasBusy = true;
+  await loadDictStatus();
+  startDictPoll();
+}
+
+async function dictDelete() {
+  if (!confirm("删除本地词典？删除后不能查词，需要时可以重新下载。")) return;
+  try {
+    await api("/dict", { method: "DELETE" });
+  } catch (err) {
+    if (err.status === 409) toast("词典正在构建中，构建完再删", "");
+    else toast(`删除失败：${err.message}`, "err");
+    return;
+  }
+  toast("词典已删除", "ok");
+  state.dictWasBusy = false;
+  stopDictPoll();
+  await loadDictStatus();
+}
+
+function onDictAction(e) {
+  const btn = e.target.closest("[data-dict]");
+  if (!btn) return;
+  const act = btn.dataset.dict;
+  if (act === "install") dictInstall(false);
+  else if (act === "rebuild") dictInstall(true);
+  else if (act === "delete") dictDelete();
+  else if (act === "refresh") loadDictStatus();
+}
+
+/* ------------------------------------------------------------ 事件绑定 */
+
+function onWordPopoverClick(e) {
+  const btn = e.target.closest("[data-wp]");
+  if (!btn) return;
+  e.preventDefault();
+  const act = btn.dataset.wp;
+  const p = state.popover;
+  if (act === "close") closeWordPopover();
+  else if (act === "speak") speakWord(p ? p.word : "");
+  else if (act === "collect") collectWord();
+  else if (act === "known") markWordKnown();
+  else if (act === "explain") explainWord();
+  else if (act === "retry") retryLookup();
+  else if (act === "settings") {
+    closeWordPopover();
+    openSettings();
+  }
+}
+
+function onReviewClick(e) {
+  const btn = e.target.closest("[data-review]");
+  if (!btn) return;
+  const act = btn.dataset.review;
+  if (act === "close") closeReview();
+  else if (act === "reveal") revealReview();
+  else if (act === "grade") gradeReview(Number(btn.dataset.grade));
+}
+
+function bindDictVocabEvents() {
+  $("nav-library").addEventListener("click", openLibraryView);
+  $("nav-vocab").addEventListener("click", openVocabView);
+  $("review-start").addEventListener("click", startReview);
+
+  $("vocab-tabs").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-status]");
+    if (!btn) return;
+    const status = btn.dataset.status;
+    if (!["all", "learning", "known", "ignored"].includes(status)) return;
+    if (state.vocab.status === status) return;
+    state.vocab.status = status;
+    renderVocabTabs();
+    loadVocab(true);
+  });
+
+  let searchTimer = null;
+  $("vocab-q").addEventListener("input", (e) => {
+    state.vocab.q = e.target.value;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => loadVocab(true), 250);
+  });
+  $("vocab-tag").addEventListener("change", (e) => {
+    state.vocab.tag = e.target.value || "";
+    loadVocab(true);
+  });
+  $("vocab-sort").addEventListener("change", (e) => {
+    state.vocab.sort = e.target.value || "recent";
+    loadVocab(true);
+  });
+  $("vocab-list").addEventListener("click", onVocabListClick);
+  $("vocab-more").addEventListener("click", () => loadVocab(false));
+  document.querySelectorAll("[data-export]").forEach((btn) => {
+    btn.addEventListener("click", () => exportVocab(btn.dataset.export));
+  });
+
+  $("word-popover").addEventListener("click", onWordPopoverClick);
+  $("popover-overlay").addEventListener("click", closeWordPopover);
+  $("review-modal").addEventListener("click", (e) => {
+    if (e.target === $("review-modal")) {
+      closeReview();
+      return;
+    }
+    onReviewClick(e);
+  });
+
+  // 设置页「词典」卡片的按钮：用委托，卡片重渲染后不用重新绑
+  $("settings-body").addEventListener("click", onDictAction);
+
+  window.addEventListener("resize", () => {
+    if (state.popover) positionWordPopover();
+  });
+  // 滚动了锚点就偏了：直接关掉，别飘在错的地方
+  window.addEventListener("scroll", () => {
+    if (state.popover) closeWordPopover();
+  }, true);
+
+  // capture 阶段先处理弹层/复习框，避免被播放器的 Esc/空格快捷键抢走
+  document.addEventListener("keydown", onOverlayKeydown, true);
+}
+
 /* ------------------------------------------------------------------ 事件 */
 
 function bindEvents() {
+  bindDictVocabEvents();
   $("add-form").addEventListener("submit", (e) => {
     e.preventDefault();
     addVideo($("url-input").value);
@@ -1241,7 +2599,8 @@ function bindEvents() {
       const wi = spans.indexOf(word);
       const words = wordListFor(seg);
       if (wi >= 0 && words[wi]) {
-        seekTo(words[wi].start_ms, { play: true });
+        // 单击单词：弹查词卡，不跳转（点行内非词区域才保持原来的跳转行为）
+        openWordPopover(word, seg, idx, wi);
         return;
       }
     }
@@ -1379,11 +2738,15 @@ function bindEvents() {
 
 /* 表单不在前端写死：后端 /api/settings 返回 fields 描述（分组/类型/枚举/范围/提示），
  * 这里按描述渲染。加一个配置项只改后端一处，前端自动出现。 */
-const GROUP_ORDER = ["网络", "下载", "转写", "解析", "切分", "服务"];
+const GROUP_ORDER = ["网络", "下载", "转写", "解析", "词典", "切分", "服务"];
 
 async function openSettings() {
   const el = $("video");
   if (el && !el.paused) el.pause();
+  // 记住从哪儿进来的：从生词本进来，关掉设置就回生词本
+  state.prevView = !$("vocab-view").classList.contains("hidden")
+    ? "vocab"
+    : state.current ? "player" : "library";
   try {
     state.settings = await api("/settings");
   } catch (err) {
@@ -1392,9 +2755,16 @@ async function openSettings() {
   }
   renderSettings();
   showView("settings");
+  loadDictStatus();
 }
 
 function closeSettings() {
+  if (state.prevView === "vocab") {
+    showView("vocab");
+    refreshVocabBadge();
+    loadVocab(true);
+    return;
+  }
   if (state.current) {
     backToLibrary();
     return;
@@ -1504,6 +2874,37 @@ function renderSettings() {
     if (!groups.has(name)) groups.set(name, []);
     groups.get(name).push(field);
   }
+  // 后端还没加「词典」字段也没关系：按接口契约的三个配置项兜底渲染。
+  // 后端一旦返回同组字段，就用后端的（不重复加）。
+  if (!groups.has("词典")) {
+    groups.set("词典", [
+      {
+        path: "dict.db_path",
+        label: "词典数据库路径",
+        group: "词典",
+        type: "path",
+        hint: "ECDICT 的 SQLite 文件；相对路径相对项目根目录",
+      },
+      {
+        path: "dict.source_url",
+        label: "ECDICT 下载地址",
+        group: "词典",
+        type: "text",
+        hint: "下载 ECDICT CSV 的地址",
+      },
+      {
+        path: "dict.max_rank",
+        label: "收录词数上限（rank）",
+        group: "词典",
+        type: "int",
+        min: 5000,
+        max: 500000,
+        hint: "只收录排名在这个范围内的词（5000–500000）",
+      },
+    ]);
+  }
+  // GET /api/settings 顺带返回的 dict 摘要可以先当状态卡数据
+  if (data.dict && !state.dictStatus) state.dictStatus = data.dict;
   const names = [...groups.keys()].sort((a, b) => {
     const ia = GROUP_ORDER.indexOf(a);
     const ib = GROUP_ORDER.indexOf(b);
@@ -1516,6 +2917,15 @@ function renderSettings() {
     const title = document.createElement("h3");
     title.textContent = name;
     card.appendChild(title);
+
+    // 「词典」组顶部：状态卡（状态/进度/下载/重建/删除）
+    if (name === "词典") {
+      const status = document.createElement("div");
+      status.id = "dict-status-card";
+      status.className = "dict-status-card dim";
+      status.textContent = "读取词典状态…";
+      card.appendChild(status);
+    }
 
     // 「解析」组顶部提示当前 LLM 状态（后端 GET /api/settings 顺带返回 llm 摘要）
     if (name === "解析") {
@@ -1534,6 +2944,7 @@ function renderSettings() {
     }
     body.appendChild(card);
   }
+  renderDictStatusCard();
   renderFfmpegStatus();
 }
 
@@ -1655,6 +3066,7 @@ function boot() {
   renderAnalysisPanel(-1);
   loadHealth();
   loadLibrary();
+  refreshVocabBadge();
 }
 
 boot();
