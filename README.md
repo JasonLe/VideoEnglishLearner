@@ -95,6 +95,30 @@ run.bat
 
 或者手动 `.venv\Scripts\python -m app.cli serve`，打开 <http://127.0.0.1:8787>。
 
+### macOS
+
+`run.command` 是给 macOS 的启动脚本：双击即可，或在终端里跑。首次运行会自动建 `.venv`、
+装依赖，之后启动并打开浏览器；`Ctrl+C` 停止。遇到 `Operation not permitted` 时先
+`chmod +x run.command`（从 GitHub 下载的压缩包会丢执行位）。
+
+```bash
+./run.command            # 正常启动
+./run.command --asr      # 顺便装本地转写依赖（faster-whisper，体积较大）
+./run.command --no-open  # 不自动开浏览器
+./run.command --help
+```
+
+手动等价于：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m app.main
+```
+
+没有 `config.toml` 也能跑（默认直连、不用代理）；需要代理或填 API Key 时，在网页「设置」里
+改完保存就会生成 `config.toml`，也可以自己 `cp config.example.toml config.toml` 再改。
+
 ffmpeg 如果不在 PATH 里，第一次打开网页会看到顶部提示，点「设置 → 下载」填 `ffmpeg.exe`
 的路径，点「检测」确认能用。
 
